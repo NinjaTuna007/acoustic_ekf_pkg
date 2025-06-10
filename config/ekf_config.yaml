@@ -1,0 +1,26 @@
+# General configuration for acoustic_ekf_pkg
+process_noise: 0.5
+measurement_noise: 1
+
+# Initialization parameters
+leader_init_samples: 5
+follower_init_samples: 1
+dt: 0.2  # Time step for the EKF
+
+# ROS topic names for reading and publishing
+publish_topic: '/follower/ekf/state'
+geopoint_topic: '/follower/ekf/geopoint'
+dist1_topic: '/follower/leader1/distance'
+dist2_topic: '/follower/leader2/distance'
+gps1_topic: '/follower/leader1/core/gps'
+gps2_topic: '/follower/leader2/core/gps'
+follower_gps_topic: '/follower/core/gps'
+imu_topic: '/follower/core/imu'
+
+# Other parameters
+max_speed: 1.5  # Maximum allowed speed for all vehicles (m/s)
+correction_factor: 1.1  # Correction factor for distance measurements
+# You can add more parameters below as needed
+# Example:
+# initial_state: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+# use_leader_velocities: false
