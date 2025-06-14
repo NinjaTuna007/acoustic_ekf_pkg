@@ -219,6 +219,9 @@ class AcousticEKFNode(Node):
         self.Q = np.eye(12, dtype=np.float32) * np.float32(process_noise)
         self.R = np.eye(3, dtype=np.float32) * np.float32(measurement_noise)
         
+        self.update_cooldown = config.get('update_cooldown', 0.5)
+        self.last_update_time = self.get_clock().now().nanoseconds / 1e9 - self.update_cooldown
+
         self.get_logger().info('AcousticEKFNode initialized, collecting leader GPS samples...')
 
     def gps_to_utm(self, lat, lon):
@@ -298,6 +301,10 @@ class AcousticEKFNode(Node):
             return
             
         with self.lock:
+            now = self.get_clock().now().nanoseconds / 1e9
+            if now - self.last_update_time < self.update_cooldown:
+                self.get_logger().debug('EKF update skipped due to cooldown')
+                return
             self.last_distances[1] = msg.data * self.correction_factor  # Apply correction factor
             if self.current_leader_positions[1] is not None:
                 # Create measurement vector [x1, y1, distance]
@@ -308,6 +315,7 @@ class AcousticEKFNode(Node):
                 ], dtype=np.float32)
                 self.get_logger().info(f'Updating EKF with leader 1 measurement: {z}')
                 self.ekf.update(z, 0)  # Use 0 for leader 1 (first leader)
+                self.last_update_time = now
                 self._publish_state_and_geopoint()
 
     def dist2_callback(self, msg):
@@ -318,6 +326,10 @@ class AcousticEKFNode(Node):
             return
             
         with self.lock:
+            now = self.get_clock().now().nanoseconds / 1e9
+            if now - self.last_update_time < self.update_cooldown:
+                self.get_logger().debug('EKF update skipped due to cooldown')
+                return
             self.last_distances[2] = msg.data * self.correction_factor  # Apply correction factor
             if self.current_leader_positions[2] is not None:
                 # Create measurement vector [x2, y2, distance]
@@ -328,6 +340,7 @@ class AcousticEKFNode(Node):
                 ], dtype=np.float32)
                 self.get_logger().info(f'Updating EKF with leader 2 measurement: {z}')
                 self.ekf.update(z, 1)  # Use 1 for leader 2 (second leader)
+                self.last_update_time = now
                 self._publish_state_and_geopoint()
 
     def imu_callback(self, msg):
