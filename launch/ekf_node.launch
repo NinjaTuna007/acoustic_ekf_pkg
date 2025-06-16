@@ -5,6 +5,7 @@
           name="acoustic_ekf_node" 
           output="screen">
         <param name="leader_velocities" value="false"/>
+        <param name="use_sim_time" value="true"/>
         <!-- Add more parameters as needed, e.g. Q, R, initial_state -->
         <!-- Example remap: -->
         <!-- <remap from="/follower/leader1/distance" to="/custom/leader1/distance"/> -->

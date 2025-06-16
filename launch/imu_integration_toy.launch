@@ -1,0 +1,8 @@
+<launch>
+    <node pkg="acoustic_ekf_pkg"
+          exec="imu_integration_toy_node"
+          name="imu_integration_toy_node"
+          output="screen">
+        <param name="config_file" value="$(find-pkg-share acoustic_ekf_pkg)/config/ekf_config.yaml" />
+    </node>
+</launch>

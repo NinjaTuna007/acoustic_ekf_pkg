@@ -4,6 +4,8 @@ import rclpy
 from rclpy.node import Node
 from std_msgs.msg import Float32, Float32MultiArray
 from sensor_msgs.msg import Imu, NavSatFix
+from nav_msgs.msg import Odometry
+from geographic_msgs.msg import GeoPoint
 import numpy as np
 import threading
 import time
@@ -11,10 +13,13 @@ import yaml
 import os
 import math
 import utm
+from tf2_ros import Buffer, TransformListener
+from geometry_msgs.msg import Vector3Stamped
+import tf_transformations
 
 
 class EKF:
-    def __init__(self, initial_state, Q=None, R=None, leader_velocities=False, dt=0.1, max_velocity=2.0):
+    def __init__(self, initial_state, Q=None, R=None, leader_velocities=False, dt=0, max_velocity=2.0):
         self.dt = np.float32(dt)
         self.Q = Q if Q is not None else np.eye(12, dtype=np.float32) * np.float32(0.01)
         self.leader_velocities = leader_velocities
@@ -37,14 +42,15 @@ class EKF:
         self.x[3] = np.clip(self.x[3], -self.max_velocity, self.max_velocity)
         self.x[6] = np.clip(self.x[6], -self.max_velocity, self.max_velocity)
         self.x[7] = np.clip(self.x[7], -self.max_velocity, self.max_velocity)
-        self.x[11] = np.clip(self.x[11], 0.0, self.max_velocity)  # Follower speed should be >= 0
+        self.x[10] = np.clip(self.x[10], -self.max_velocity, self.max_velocity)
+        self.x[11] = np.clip(self.x[11], -self.max_velocity, self.max_velocity)  # Follower speed should be >= 0
 
     def predict(self):
         # Store previous state
         self.previous_x = self.x.copy()
         
         # Extract state variables
-        x1, y1, vx1, vy1, x2, y2, vx2, vy2, xf, yf, thetaf, vf = self.x.flatten()
+        x1, y1, vx1, vy1, x2, y2, vx2, vy2, xf, yf, vfx, vfy = self.x.flatten()
         
         # State transition matrix F
         F = np.array([
@@ -56,8 +62,8 @@ class EKF:
             [0, 0, 0, 0, 0, 1, 0, self.dt, 0, 0, 0, 0],
             [0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0],
             [0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0],
-            [0, 0, 0, 0, 0, 0, 0, 0, 1, 0, self.dt * -np.sin(thetaf) * vf, -self.dt * np.cos(thetaf)],
-            [0, 0, 0, 0, 0, 0, 0, 0, 0, 1, self.dt * np.cos(thetaf) * vf, self.dt * np.sin(thetaf)],
+            [0, 0, 0, 0, 0, 0, 0, 0, 1, 0, self.dt, 0],
+            [0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, self.dt],
             [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0],
             [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]
         ], dtype=np.float32)
@@ -72,10 +78,10 @@ class EKF:
             [y2 + vy2 * self.dt],
             [vx2],
             [vy2],
-            [xf + vf * np.cos(thetaf) * self.dt],
-            [yf + vf * np.sin(thetaf) * self.dt],
-            [thetaf],
-            [vf]
+            [xf + vfx * self.dt],
+            [yf + vfy * self.dt],
+            [vfx],
+            [vfy]
         ], dtype=np.float32)
         
         # Predict covariance
@@ -128,7 +134,7 @@ class EKF:
         return self.x.flatten()
 
     def get_expected_measurement(self, leader_id):
-        x1, y1, vx1, vy1, x2, y2, vx2, vy2, xf, yf, thetaf, vf = self.x.flatten()
+        x1, y1, vx1, vy1, x2, y2, vx2, vy2, xf, yf, vfx, vfy = self.x.flatten()
         
         if leader_id == 0:  # Leader 1 (first leader in EKF state)
             if self.leader_velocities:
@@ -165,7 +171,7 @@ class AcousticEKFNode(Node):
         self.leader_init_samples = config.get('leader_init_samples', 10)
         self.follower_init_samples = config.get('follower_init_samples', 3)
         self.max_speed = config.get('max_speed', 2.0)
-        self.dt = config.get('dt', 0.1)  # Read dt from config
+        self.dt = 0 # config.get('dt', 0.1)  # Read dt from config
         self.correction_factor = config.get('correction_factor', 1.0)  # Correction factor for distance measurements
         
         # Topic names from config
@@ -177,6 +183,9 @@ class AcousticEKFNode(Node):
         gps2_topic = config.get('gps2_topic', '/follower/leader2/core/gps')
         follower_gps_topic = config.get('follower_gps_topic', '/follower/core/gps')
         imu_topic = config.get('imu_topic', '/follower/core/imu')
+        odom_topic = config.get('odom_topic', '/lolo/smarc/odom')
+        leader_gps_type = config.get('leader_gps_type', 'NavSatFix')
+        self.leader_gps_type = leader_gps_type
         
         # Publishers
         self.state_pub = self.create_publisher(Float32MultiArray, publish_topic, 10)
@@ -195,6 +204,7 @@ class AcousticEKFNode(Node):
         self.leader_gps_samples = {1: [], 2: []}  # Using leader 1 and 2
         self.follower_gps_samples = []
         self.initialization_phase = 'collecting_leaders'  # 'collecting_leaders', 'collecting_follower', 'ready'
+        self.follower_utm_offset = None  # Offset in UTM coordinates for follower GPS
         
         # Current measurements in UTM coordinates
         self.current_leader_positions = {1: None, 2: None}  # In UTM coordinates
@@ -207,13 +217,19 @@ class AcousticEKFNode(Node):
         # Subscriptions
         self.create_subscription(Float32, dist1_topic, self.dist1_callback, 10)
         self.create_subscription(Float32, dist2_topic, self.dist2_callback, 10)
-        self.create_subscription(NavSatFix, gps1_topic, self.gps1_callback, 10)
-        self.create_subscription(NavSatFix, gps2_topic, self.gps2_callback, 10)
+        if leader_gps_type == 'GeoPoint':
+            from geographic_msgs.msg import GeoPoint
+            self.create_subscription(GeoPoint, gps1_topic, self.gps1_geopoint_callback, 10)
+            self.create_subscription(GeoPoint, gps2_topic, self.gps2_geopoint_callback, 10)
+        else:
+            self.create_subscription(NavSatFix, gps1_topic, self.gps1_callback, 10)
+            self.create_subscription(NavSatFix, gps2_topic, self.gps2_callback, 10)
         self.create_subscription(NavSatFix, follower_gps_topic, self.follower_gps_callback, 10)
-        self.create_subscription(Imu, imu_topic, self.imu_callback, 10)
+        odom_topic = config.get('odom_topic', '/lolo/smarc/odom')
+        self.create_subscription(Odometry, odom_topic, self.odom_callback, 10)
         
-        # Timer for prediction step
-        self.timer = self.create_timer(self.dt, self.timer_callback)
+        # Timer for prediction step (DISABLED: prediction now triggered by GPS timestamps)
+        # self.timer = self.create_timer(self.dt, self.timer_callback)
         
         # EKF matrices
         self.Q = np.eye(12, dtype=np.float32) * np.float32(process_noise)
@@ -224,29 +240,48 @@ class AcousticEKFNode(Node):
 
         self.get_logger().info('AcousticEKFNode initialized, collecting leader GPS samples...')
 
+        self.leader_depth = config.get('leader_depth', 0.5)
+        depth_topic = config.get('depth_topic', '/lolo/smarc/depth')
+        self.depth = None
+        self.create_subscription(Float32, depth_topic, self.depth_callback, 10)
+
+        # TF2 transform listener
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self)
+        self.imu_frame = 'lolo/base_link'  # Adjust if your IMU frame is different
+        self.utm_frame = 'utm'            # UTM frame from your tf tree
+
+        self.last_predict_time = None  # For variable dt prediction
+
+        # Set use_sim_time parameter
+        self.set_parameters([rclpy.parameter.Parameter('use_sim_time', rclpy.Parameter.Type.BOOL, True)])
+
     def gps_to_utm(self, lat, lon):
-        """Convert GPS to UTM coordinates, establishing reference zone from first conversion"""
+        """Convert GPS to UTM coordinates, establishing reference zone from first conversion, with higher precision."""
         try:
-            x, y, zone_number, zone_letter = utm.from_latlon(lat, lon)
-            
-            # Set reference zone from first GPS message
+            x, y, zone_number, zone_letter = utm.from_latlon(float(lat), float(lon))
             if self.utm_zone_number is None:
                 self.utm_zone_number = zone_number
                 self.utm_zone_letter = zone_letter
                 self.get_logger().info(f'UTM reference zone set to: {zone_number}{zone_letter}')
-            
+            # Format to 8 decimal places for internal use
+            x = float(f"{x:.8f}")
+            y = float(f"{y:.8f}")
             return x, y
         except Exception as e:
             self.get_logger().error(f'UTM conversion failed: {e}')
             return None, None
 
     def utm_to_gps(self, x, y):
-        """Convert UTM coordinates back to GPS"""
+        """Convert UTM coordinates back to GPS with higher precision."""
         if self.utm_zone_number is None or self.utm_zone_letter is None:
             return None, None
-        
         try:
-            lat, lon = utm.to_latlon(x, y, self.utm_zone_number, self.utm_zone_letter)
+            # Use higher precision for UTM to lat/lon conversion
+            lat, lon = utm.to_latlon(float(x), float(y), int(self.utm_zone_number), str(self.utm_zone_letter))
+            # Format to 8 decimal places for publishing
+            lat = float(f"{lat:.12f}")
+            lon = float(f"{lon:.12f}")
             return lat, lon
         except Exception as e:
             self.get_logger().error(f'UTM to GPS conversion failed: {e}')
@@ -261,11 +296,14 @@ class AcousticEKFNode(Node):
                                    f'lat={msg.latitude:.6f}, lon={msg.longitude:.6f}')
             self._check_leader_initialization()
         elif self.initialization_phase == 'ready':
-            # Convert GPS to UTM coordinates
             x, y = self.gps_to_utm(msg.latitude, msg.longitude)
-            if x is not None and y is not None:
-                self.current_leader_positions[1] = (x, y)
-                self.get_logger().info(f'Updated current_leader_positions[1] to ({x:.2f}, {y:.2f})')
+            if x is not None and y is not None and self.follower_utm_offset is not None:
+                offset_x = x - self.follower_utm_offset[0]
+                offset_y = y - self.follower_utm_offset[1]
+                self.current_leader_positions[1] = (offset_x, offset_y)
+                self.get_logger().info(f'Updated current_leader_positions[1] to ({offset_x:.2f}, {offset_y:.2f}) [offset applied]')
+            else:
+                self.get_logger().warn('Follower UTM offset not initialized or UTM conversion failed for leader 1!')
 
     def gps2_callback(self, msg):
         """Handle GPS data from leader 2"""
@@ -276,22 +314,64 @@ class AcousticEKFNode(Node):
                                    f'lat={msg.latitude:.6f}, lon={msg.longitude:.6f}')
             self._check_leader_initialization()
         elif self.initialization_phase == 'ready':
-            # Convert GPS to UTM coordinates
             x, y = self.gps_to_utm(msg.latitude, msg.longitude)
+            if x is not None and y is not None and self.follower_utm_offset is not None:
+                offset_x = x - self.follower_utm_offset[0]
+                offset_y = y - self.follower_utm_offset[1]
+                self.current_leader_positions[2] = (offset_x, offset_y)
+                self.get_logger().info(f'Updated current_leader_positions[2] to ({offset_x:.2f}, {offset_y:.2f}) [offset applied]')
+            else:
+                self.get_logger().warn('Follower UTM offset not initialized or UTM conversion failed for leader 2!')
+
+    def gps1_geopoint_callback(self, msg):
+        """Handle GeoPoint data from leader 1"""
+        lat, lon = msg.latitude, msg.longitude
+        self.get_logger().info(f'Received GPS1 (GeoPoint): lat={lat:.6f}, lon={lon:.6f}')
+        if self.initialization_phase == 'collecting_leaders':
+            self.leader_gps_samples[1].append((lat, lon))
+            self.get_logger().info(f'Leader 1 GPS sample {len(self.leader_gps_samples[1])}/{self.leader_init_samples}: lat={lat:.6f}, lon={lon:.6f}')
+            self._check_leader_initialization()
+        elif self.initialization_phase == 'ready':
+            x, y = self.gps_to_utm(lat, lon)
+            if x is not None and y is not None:
+                self.current_leader_positions[1] = (x, y)
+                self.get_logger().info(f'Updated current_leader_positions[1] to ({x:.2f}, {y:.2f})')
+
+    def gps2_geopoint_callback(self, msg):
+        """Handle GeoPoint data from leader 2"""
+        lat, lon = msg.latitude, msg.longitude
+        self.get_logger().info(f'Received GPS2 (GeoPoint): lat={lat:.6f}, lon={lon:.6f}')
+        if self.initialization_phase == 'collecting_leaders':
+            self.leader_gps_samples[2].append((lat, lon))
+            self.get_logger().info(f'Leader 2 GPS sample {len(self.leader_gps_samples[2])}/{self.leader_init_samples}: lat={lat:.6f}, lon={lon:.6f}')
+            self._check_leader_initialization()
+        elif self.initialization_phase == 'ready':
+            x, y = self.gps_to_utm(lat, lon)
             if x is not None and y is not None:
                 self.current_leader_positions[2] = (x, y)
                 self.get_logger().info(f'Updated current_leader_positions[2] to ({x:.2f}, {y:.2f})')
 
     def follower_gps_callback(self, msg):
-        """Handle GPS data from follower for initialization"""
-        self.get_logger().info(f'Received follower GPS: lat={msg.latitude:.6f}, lon={msg.longitude:.6f}')
+        """Handle GPS data from follower for initialization and trigger EKF prediction with variable dt"""
+        # self.get_logger().info(f'Received follower GPS: lat={msg.latitude:.6f}, lon={msg.longitude:.6f}')
+        # Use message time for dt
+        t = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
         if self.initialization_phase == 'collecting_follower':
             self.follower_gps_samples.append((msg.latitude, msg.longitude))
             self.get_logger().info(f'Follower GPS sample {len(self.follower_gps_samples)}/{self.follower_init_samples}: '
                                    f'lat={msg.latitude:.6f}, lon={msg.longitude:.6f}')
-            
             if len(self.follower_gps_samples) >= self.follower_init_samples:
                 self._initialize_ekf()
+        elif self.initialization_phase == 'ready' and self.ekf is not None:
+            # Variable dt prediction step
+            if self.last_predict_time is not None:
+                dt = t - self.last_predict_time
+                if dt > 0:
+                    with self.lock:
+                        self.ekf.dt = np.float32(dt)
+                        self.ekf.predict()
+                        self._publish_state_and_geopoint()
+            self.last_predict_time = t
 
     def dist1_callback(self, msg):
         """Handle distance measurement from leader 1"""
@@ -299,22 +379,31 @@ class AcousticEKFNode(Node):
         if self.initialization_phase != 'ready':
             self.get_logger().info('dist1_callback ignored: not ready')
             return
-            
         with self.lock:
             now = self.get_clock().now().nanoseconds / 1e9
             if now - self.last_update_time < self.update_cooldown:
                 self.get_logger().debug('EKF update skipped due to cooldown')
                 return
-            self.last_distances[1] = msg.data * self.correction_factor  # Apply correction factor
+            # Calculate horizontal distance if depth is available
+            if self.depth is not None:
+                try:
+                    d = msg.data * self.correction_factor
+                    z_depth = max(self.depth - self.leader_depth, 0.0)
+                    horiz_dist = math.sqrt(max(d**2 - z_depth**2, 0.0))
+                    self.last_distances[1] = horiz_dist
+                except Exception as e:
+                    self.get_logger().error(f'Error computing horizontal distance: {e}')
+                    self.last_distances[1] = msg.data * self.correction_factor
+            else:
+                self.last_distances[1] = msg.data * self.correction_factor
             if self.current_leader_positions[1] is not None:
-                # Create measurement vector [x1, y1, distance]
                 z = np.array([
                     self.current_leader_positions[1][0],
                     self.current_leader_positions[1][1],
                     self.last_distances[1]
                 ], dtype=np.float32)
                 self.get_logger().info(f'Updating EKF with leader 1 measurement: {z}')
-                self.ekf.update(z, 0)  # Use 0 for leader 1 (first leader)
+                self.ekf.update(z, 0)
                 self.last_update_time = now
                 self._publish_state_and_geopoint()
 
@@ -324,40 +413,78 @@ class AcousticEKFNode(Node):
         if self.initialization_phase != 'ready':
             self.get_logger().info('dist2_callback ignored: not ready')
             return
-            
         with self.lock:
             now = self.get_clock().now().nanoseconds / 1e9
             if now - self.last_update_time < self.update_cooldown:
                 self.get_logger().debug('EKF update skipped due to cooldown')
                 return
-            self.last_distances[2] = msg.data * self.correction_factor  # Apply correction factor
+            # Calculate horizontal distance if depth is available
+            if self.depth is not None:
+                try:
+                    d = msg.data * self.correction_factor
+                    z_depth = max(self.depth - self.leader_depth, 0.0)
+                    horiz_dist = math.sqrt(max(d**2 - z_depth**2, 0.0))
+                    self.last_distances[2] = horiz_dist
+                except Exception as e:
+                    self.get_logger().error(f'Error computing horizontal distance: {e}')
+                    self.last_distances[2] = msg.data * self.correction_factor
+            else:
+                self.last_distances[2] = msg.data * self.correction_factor
             if self.current_leader_positions[2] is not None:
-                # Create measurement vector [x2, y2, distance]
                 z = np.array([
                     self.current_leader_positions[2][0],
                     self.current_leader_positions[2][1],
                     self.last_distances[2]
                 ], dtype=np.float32)
                 self.get_logger().info(f'Updating EKF with leader 2 measurement: {z}')
-                self.ekf.update(z, 1)  # Use 1 for leader 2 (second leader)
+                self.ekf.update(z, 1)
                 self.last_update_time = now
                 self._publish_state_and_geopoint()
 
-    def imu_callback(self, msg):
-        """Handle IMU data"""
-        self.get_logger().info('Received IMU data')
-        self.last_imu = msg
+    def odom_callback(self, msg):
+        """Update follower velocity in UTM frame directly from odometry topic, transforming from baselink if needed."""
+        if self.initialization_phase != 'ready' or self.ekf is None:
+            return
+        with self.lock:
+            vx = msg.twist.twist.linear.x
+            vy = msg.twist.twist.linear.y
+            vz = msg.twist.twist.linear.z  # Assuming z velocity is also available
+            # Transform velocity from baselink to UTM frame using tf2
+            if self.tf_buffer.can_transform(self.utm_frame, msg.header.frame_id, rclpy.time.Time(), timeout=rclpy.duration.Duration(seconds=0.1)):
+                try:
+                    t = self.tf_buffer.lookup_transform(
+                        self.utm_frame, 'lolo/base_link', rclpy.time.Time(), timeout=rclpy.duration.Duration(seconds=0.1)
+                    )
+                    q = t.transform.rotation
+                    quat = [q.x, q.y, q.z, q.w]
+                    import tf_transformations
+                    rot_mat = tf_transformations.quaternion_matrix(quat)[:3, :3]
+                    vel_vec = np.array([vx, vy, vz])
+                    vel_utm = rot_mat @ vel_vec
+                    vx_utm = vel_utm[0]
+                    vy_utm = vel_utm[1]
+                    self.ekf.x[10] = vx_utm
+                    self.ekf.x[11] = vy_utm
+                    # self.get_logger().info(f'Updated follower velocity from odometry (UTM): vfx={vx_utm:.3f}, vfy={vy_utm:.3f}')
+                except Exception as e:
+                    self.get_logger().warn(f'Odom tf transform failed: {e}. Using raw odom velocity.')
+                    self.ekf.x[10] = vx
+                    self.ekf.x[11] = vy
+            else:
+                self.get_logger().warn(f'TF transform from {msg.header.frame_id} to {self.utm_frame} not available. Using raw odom velocity.')
+                self.ekf.x[10] = vx
+                self.ekf.x[11] = vy
 
     def timer_callback(self):
-        """Prediction step of EKF"""
-        self.get_logger().debug('Timer callback triggered')
+        """Prediction step of EKF and always publish state."""
         if self.initialization_phase != 'ready' or self.ekf is None:
-            self.get_logger().debug('Timer callback ignored: not ready or EKF not initialized')
             return
-            
         with self.lock:
             self.ekf.predict()
-            self._publish_state_and_geopoint()
+            self._publish_state_and_geopoint()  # Always publish after prediction
+
+    def depth_callback(self, msg):
+        self.depth = msg.data
 
     def _check_leader_initialization(self):
         """Check if we have enough leader GPS samples to initialize"""
@@ -368,7 +495,7 @@ class AcousticEKFNode(Node):
             self.get_logger().info('Leaders initialized, now collecting follower GPS samples...')
 
     def _initialize_ekf(self):
-        """Initialize EKF with collected GPS samples in UTM coordinates"""
+        """Initialize EKF with collected GPS samples in UTM coordinates and store follower UTM offset."""
         self.get_logger().info('Initializing EKF...')
         # Use only the last 10 samples if more are available
         leader1_samples = self.leader_gps_samples[1][-self.leader_init_samples:] if len(self.leader_gps_samples[1]) > self.leader_init_samples else self.leader_gps_samples[1]
@@ -396,42 +523,39 @@ class AcousticEKFNode(Node):
         leader1_x, leader1_y = self.gps_to_utm(avg_lat1, avg_lon1)
         leader2_x, leader2_y = self.gps_to_utm(avg_lat2, avg_lon2)
         follower_x, follower_y = self.gps_to_utm(avg_follower_lat, avg_follower_lon)
-        
         if None in [leader1_x, leader1_y, leader2_x, leader2_y, follower_x, follower_y]:
             self.get_logger().error('Failed to convert GPS to UTM coordinates')
             return
-        
+        # Store follower UTM offset for later use
+        self.follower_utm_offset = np.array([follower_x, follower_y], dtype=np.float64)
         # Initialize EKF state vector: [x1, y1, vx1, vy1, x2, y2, vx2, vy2, xf, yf, thetaf, vf]
         initial_state = np.array([
-            leader1_x, leader1_y, 0.0, 0.0,  # Leader 1 position and velocity
-            leader2_x, leader2_y, 0.0, 0.0,  # Leader 2 position and velocity
-            follower_x, follower_y, 0.0, 0.0  # Follower position, heading, and velocity
+            leader1_x - follower_x, leader1_y - follower_y, 0.0, 0.0,  # Leader 1 position and velocity (offset)
+            leader2_x - follower_x, leader2_y - follower_y, 0.0, 0.0,  # Leader 2 position and velocity (offset)
+            0.0, 0.0, 0.0, 0.0 # Follower position and velocity (origin)
         ], dtype=np.float32)
-        
-        # Initialize EKF
         self.ekf = EKF(initial_state, Q=self.Q, R=self.R, dt=self.dt, max_velocity=self.max_speed)
         self.initialization_phase = 'ready'
-        
-        self.get_logger().info(f'EKF initialized with UTM coordinates:')
-        self.get_logger().info(f'  Leader 1: ({leader1_x:.2f}, {leader1_y:.2f})')
-        self.get_logger().info(f'  Leader 2: ({leader2_x:.2f}, {leader2_y:.2f})')
-        self.get_logger().info(f'  Follower: ({follower_x:.2f}, {follower_y:.2f})')
+        self.get_logger().info(f'EKF initialized with UTM offset: {self.follower_utm_offset}')
         self.get_logger().info('EKF ready for operation!')
 
     def _publish_state_and_geopoint(self):
-        """Publish EKF state and NavSatFix"""
-        if self.ekf is None:
+        """Publish EKF state and NavSatFix, adding back follower UTM offset."""
+        if self.ekf is None or self.follower_utm_offset is None:
+            self.get_logger().warn('Cannot publish: EKF or follower_utm_offset not initialized!')
             return
-            
         state = self.ekf.get_state()
-        
-        # Publish state vector
+        # Publish state vector (still offset)
         state_msg = Float32MultiArray()
         state_msg.data = state.tolist()
         self.state_pub.publish(state_msg)
-        
-        # Follower position
-        follower_x, follower_y = state[8], state[9]
+        # Add offset back for publishing
+        follower_x = state[8] + self.follower_utm_offset[0]
+        follower_y = state[9] + self.follower_utm_offset[1]
+        # Sanity check for out-of-range UTM values
+        if abs(follower_x) > 1e7 or abs(follower_y) > 1e7:
+            self.get_logger().warn(f'Follower UTM values out of range: x={follower_x}, y={follower_y}. Skipping publish.')
+            return
         follower_lat, follower_lon = self.utm_to_gps(follower_x, follower_y)
         if follower_lat is not None and follower_lon is not None:
             navsat_msg = NavSatFix()
@@ -443,34 +567,40 @@ class AcousticEKFNode(Node):
             navsat_msg.status.status = 0
             navsat_msg.status.service = 1
             self.geopoint_pub.publish(navsat_msg)
-
         # Leader 1 position
-        leader1_x, leader1_y = state[0], state[1]
-        leader1_lat, leader1_lon = self.utm_to_gps(leader1_x, leader1_y)
-        if leader1_lat is not None and leader1_lon is not None:
-            navsat_leader1 = NavSatFix()
-            navsat_leader1.latitude = leader1_lat
-            navsat_leader1.longitude = leader1_lon
-            navsat_leader1.altitude = 0.0
-            navsat_leader1.header.stamp = self.get_clock().now().to_msg()
-            navsat_leader1.header.frame_id = "map"
-            navsat_leader1.status.status = 0
-            navsat_leader1.status.service = 1
-            self.geopoint_pub_leader1.publish(navsat_leader1)
-
+        leader1_x = state[0] + self.follower_utm_offset[0]
+        leader1_y = state[1] + self.follower_utm_offset[1]
+        if abs(leader1_x) > 1e7 or abs(leader1_y) > 1e7:
+            self.get_logger().warn(f'Leader1 UTM values out of range: x={leader1_x}, y={leader1_y}. Skipping publish.')
+        else:
+            leader1_lat, leader1_lon = self.utm_to_gps(leader1_x, leader1_y)
+            if leader1_lat is not None and leader1_lon is not None:
+                navsat_leader1 = NavSatFix()
+                navsat_leader1.latitude = leader1_lat
+                navsat_leader1.longitude = leader1_lon
+                navsat_leader1.altitude = 0.0
+                navsat_leader1.header.stamp = self.get_clock().now().to_msg()
+                navsat_leader1.header.frame_id = "map"
+                navsat_leader1.status.status = 0
+                navsat_leader1.status.service = 1
+                self.geopoint_pub_leader1.publish(navsat_leader1)
         # Leader 2 position
-        leader2_x, leader2_y = state[4], state[5]
-        leader2_lat, leader2_lon = self.utm_to_gps(leader2_x, leader2_y)
-        if leader2_lat is not None and leader2_lon is not None:
-            navsat_leader2 = NavSatFix()
-            navsat_leader2.latitude = leader2_lat
-            navsat_leader2.longitude = leader2_lon
-            navsat_leader2.altitude = 0.0
-            navsat_leader2.header.stamp = self.get_clock().now().to_msg()
-            navsat_leader2.header.frame_id = "map"
-            navsat_leader2.status.status = 0
-            navsat_leader2.status.service = 1
-            self.geopoint_pub_leader2.publish(navsat_leader2)
+        leader2_x = state[4] + self.follower_utm_offset[0]
+        leader2_y = state[5] + self.follower_utm_offset[1]
+        if abs(leader2_x) > 1e7 or abs(leader2_y) > 1e7:
+            self.get_logger().warn(f'Leader2 UTM values out of range: x={leader2_x}, y={leader2_y}. Skipping publish.')
+        else:
+            leader2_lat, leader2_lon = self.utm_to_gps(leader2_x, leader2_y)
+            if leader2_lat is not None and leader2_lon is not None:
+                navsat_leader2 = NavSatFix()
+                navsat_leader2.latitude = leader2_lat
+                navsat_leader2.longitude = leader2_lon
+                navsat_leader2.altitude = 0.0
+                navsat_leader2.header.stamp = self.get_clock().now().to_msg()
+                navsat_leader2.header.frame_id = "map"
+                navsat_leader2.status.status = 0
+                navsat_leader2.status.service = 1
+                self.geopoint_pub_leader2.publish(navsat_leader2)
 
 
 def main(args=None):

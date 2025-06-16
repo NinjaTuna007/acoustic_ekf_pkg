@@ -23,6 +23,9 @@ setup(
     entry_points={
         'console_scripts': [
             'ekf_node = acoustic_ekf_pkg.ekf_node:main',
+            'imu_integration_toy_node = acoustic_ekf_pkg.imu_integration_toy_node:main',
+            'odom_integration_node = acoustic_ekf_pkg.odom_integration_node:main',
+            'trajectory_estimator_node = acoustic_ekf_pkg.trajectory_estimator_node:main',
         ],
     },
 )
