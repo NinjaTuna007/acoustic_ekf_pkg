@@ -225,8 +225,10 @@ class AcousticEKFNode(Node):
             self.create_subscription(NavSatFix, gps1_topic, self.gps1_callback, 10)
             self.create_subscription(NavSatFix, gps2_topic, self.gps2_callback, 10)
         self.create_subscription(NavSatFix, follower_gps_topic, self.follower_gps_callback, 10)
-        odom_topic = config.get('odom_topic', '/lolo/smarc/odom')
-        self.create_subscription(Odometry, odom_topic, self.odom_callback, 10)
+        # self.create_subscription(Odometry, odom_topic, self.odom_callback, 10)  # <-- Commented out odom callback
+        heading_topic = '/lolo/smarc/heading'
+        self.create_subscription(Float32, heading_topic, self.heading_callback, 10)
+        self.create_subscription(Imu, imu_topic, self.imu_callback, 10)  # <-- Added IMU subscription
         
         # Timer for prediction step (DISABLED: prediction now triggered by GPS timestamps)
         # self.timer = self.create_timer(self.dt, self.timer_callback)
@@ -441,39 +443,37 @@ class AcousticEKFNode(Node):
                 self.last_update_time = now
                 self._publish_state_and_geopoint()
 
-    def odom_callback(self, msg):
-        """Update follower velocity in UTM frame directly from odometry topic, transforming from baselink if needed."""
+    def heading_callback(self, msg):
+        """Update the current heading (degrees, 0=N) and rotate follower velocity accordingly."""
+        self.current_heading_deg = msg.data
+        # Only update velocity if EKF is ready and we have a velocity estimate
         if self.initialization_phase != 'ready' or self.ekf is None:
             return
-        with self.lock:
-            vx = msg.twist.twist.linear.x
-            vy = msg.twist.twist.linear.y
-            vz = msg.twist.twist.linear.z  # Assuming z velocity is also available
-            # Transform velocity from baselink to UTM frame using tf2
-            if self.tf_buffer.can_transform(self.utm_frame, msg.header.frame_id, rclpy.time.Time(), timeout=rclpy.duration.Duration(seconds=0.1)):
-                try:
-                    t = self.tf_buffer.lookup_transform(
-                        self.utm_frame, 'lolo/base_link', rclpy.time.Time(), timeout=rclpy.duration.Duration(seconds=0.1)
-                    )
-                    q = t.transform.rotation
-                    quat = [q.x, q.y, q.z, q.w]
-                    import tf_transformations
-                    rot_mat = tf_transformations.quaternion_matrix(quat)[:3, :3]
-                    vel_vec = np.array([vx, vy, vz])
-                    vel_utm = rot_mat @ vel_vec
-                    vx_utm = vel_utm[0]
-                    vy_utm = vel_utm[1]
-                    self.ekf.x[10] = vx_utm
-                    self.ekf.x[11] = vy_utm
-                    # self.get_logger().info(f'Updated follower velocity from odometry (UTM): vfx={vx_utm:.3f}, vfy={vy_utm:.3f}')
-                except Exception as e:
-                    self.get_logger().warn(f'Odom tf transform failed: {e}. Using raw odom velocity.')
-                    self.ekf.x[10] = vx
-                    self.ekf.x[11] = vy
-            else:
-                self.get_logger().warn(f'TF transform from {msg.header.frame_id} to {self.utm_frame} not available. Using raw odom velocity.')
-                self.ekf.x[10] = vx
-                self.ekf.x[11] = vy
+        # Use the follower's speed (in EKF state) and heading to set vfx, vfy
+        # Assume follower speed is stored in state[10] (vfx) and state[11] (vfy) as body-frame velocities
+        # We'll rotate the speed according to heading (0=N, 90=E, 180=S, 270=W)
+        speed = math.hypot(self.ekf.x[10], self.ekf.x[11])
+        heading_rad = math.radians(90 - self.current_heading_deg)  # Convert compass to math angle (0=E)
+        vx = speed * math.cos(heading_rad)
+        vy = speed * math.sin(heading_rad)
+        self.ekf.x[10] = vx
+        self.ekf.x[11] = vy
+        self.get_logger().debug(f'Heading update: heading={self.current_heading_deg:.2f} deg, vx={vx:.3f}, vy={vy:.3f}')
+
+    def imu_callback(self, msg):
+        """Trigger EKF prediction step on IMU message."""
+        if self.initialization_phase != 'ready' or self.ekf is None:
+            return
+        # Use IMU timestamp for dt if available
+        t = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
+        if hasattr(self, 'last_predict_time') and self.last_predict_time is not None:
+            dt = t - self.last_predict_time
+            if dt > 0:
+                with self.lock:
+                    self.ekf.dt = np.float32(dt)
+                    self.ekf.predict()
+                    self._publish_state_and_geopoint()
+        self.last_predict_time = t
 
     def timer_callback(self):
         """Prediction step of EKF and always publish state."""
