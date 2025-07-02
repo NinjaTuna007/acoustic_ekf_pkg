@@ -9,6 +9,8 @@ import yaml
 import utm
 from tf2_ros import Buffer, TransformListener
 import tf_transformations
+import matplotlib.pyplot as plt
+import signal
 
 class ImuIntegrationToyNode(Node):
     def __init__(self):
@@ -37,6 +39,10 @@ class ImuIntegrationToyNode(Node):
         self.utm_frame = config.get('utm_frame', 'utm')
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
+        self.trajectory = []  # Store UTM positions for plotting
+        self._plot_on_exit = False
+        signal.signal(signal.SIGINT, self.handle_sigint)
+        signal.signal(signal.SIGTERM, self.handle_sigint)
 
     def gps_callback(self, msg):
         if not self.gps_initialized:
@@ -94,6 +100,7 @@ class ImuIntegrationToyNode(Node):
         # Integrate position in UTM
         self.position[0] += self.velocity[0] * dt
         self.position[1] += self.velocity[1] * dt
+        self.trajectory.append(self.position.copy())  # Store for plotting
         # Log for validation
         # self.get_logger().info(f'IMU t={t:.3f}, dt={dt:.3f}, acc_utm=({ax:.3f}, {ay:.3f}), vel=({self.velocity[0]:.3f}, {self.velocity[1]:.3f}), pos=({self.position[0]:.3f}, {self.position[1]:.3f})')
         # Convert UTM back to lat/lon for publishing
@@ -114,13 +121,13 @@ class ImuIntegrationToyNode(Node):
     def odom_callback(self, msg):
         """
         Callback to initialize velocity from odometry, transforming to UTM frame if needed.
-        Only sets velocity once at startup.
+        Only sets velocity once at startup. Waits for transform to be available, does NOT initialize with raw odom velocity.
         """
         if not self.odom_initialized and self.gps_initialized:
             vx = msg.twist.twist.linear.x
             vy = msg.twist.twist.linear.y
-            # Transform odom velocity to UTM frame using tf if needed
-            if self.tf_buffer.can_transform(self.utm_frame, msg.header.frame_id, rclpy.time.Time(), timeout=rclpy.duration.Duration(seconds=0.1)):
+            # Only initialize if transform is available
+            if self.tf_buffer.can_transform(self.utm_frame, 'lolo/base_link', rclpy.time.Time(), timeout=rclpy.duration.Duration(seconds=0.1)):
                 try:
                     t = self.tf_buffer.lookup_transform(
                         self.utm_frame, 'lolo/base_link', rclpy.time.Time(), timeout=rclpy.duration.Duration(seconds=0.1)
@@ -133,23 +140,44 @@ class ImuIntegrationToyNode(Node):
                     vx_utm = vel_utm[0]
                     vy_utm = vel_utm[1]
                     self.velocity = np.array([vx_utm, vy_utm])
+                    self.odom_initialized = True
                     self.get_logger().info(f'Initialized velocity from odometry (transformed to UTM): vx={vx_utm:.3f}, vy={vy_utm:.3f}')
-                    
                 except Exception as e:
-                    self.get_logger().warn(f'Odom tf transform failed: {e}. Using raw odom velocity.')
-                    self.velocity = np.array([vx, vy])
+                    self.get_logger().warn(f'Odom tf transform failed: {e}. Will retry.')
             else:
-                self.get_logger().warn(f'TF transform from {msg.header.frame_id} to {self.utm_frame} not available. Using raw odom velocity.')
-                self.velocity = np.array([vx, vy])
-            self.odom_initialized = True
-            self.get_logger().info(f'Initialized velocity from odometry: vx={vx:.3f}, vy={vy:.3f}')
+                self.get_logger().warn(f'TF transform from lolo/base_link to {self.utm_frame} not available. Waiting to initialize velocity.')
+
+    def handle_sigint(self, signum, frame):
+        self._plot_on_exit = True
+        # Do NOT call rclpy.shutdown() here! Let main() handle shutdown and plotting.
+
+    def plot_trajectory(self):
+        if self.trajectory:
+            traj = np.array(self.trajectory)
+            plt.figure(figsize=(8, 6))
+            plt.plot(traj[:, 0], traj[:, 1], '-', color='royalblue', linewidth=2, label='UTM Trajectory')
+            plt.scatter(traj[0, 0], traj[0, 1], color='green', s=60, label='Start')
+            plt.scatter(traj[-1, 0], traj[-1, 1], color='red', s=60, label='End')
+            plt.xlabel('UTM X (meters)')
+            plt.ylabel('UTM Y (meters)')
+            plt.title('IMU Integration UTM Trajectory')
+            plt.legend()
+            plt.grid(True, linestyle='--', alpha=0.6)
+            plt.tight_layout()
+            plt.show(block=True)
 
 def main(args=None):
     rclpy.init(args=args)
     node = ImuIntegrationToyNode()
-    rclpy.spin(node)
-    node.destroy_node()
-    rclpy.shutdown()
+    try:
+        rclpy.spin(node)
+    finally:
+        # Clean up ROS node resources first
+        node.destroy_node()
+        # Now safe to plot using plain Python attributes
+        if getattr(node, '_plot_on_exit', False):
+            node.plot_trajectory()
+        rclpy.shutdown()
 
 if __name__ == '__main__':
     main()

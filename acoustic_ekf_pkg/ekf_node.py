@@ -444,21 +444,88 @@ class AcousticEKFNode(Node):
                 self._publish_state_and_geopoint()
 
     def heading_callback(self, msg):
-        """Update the current heading (degrees, 0=N) and rotate follower velocity accordingly."""
+        """EKF update using heading measurement with proper Jacobians."""
         self.current_heading_deg = msg.data
-        # Only update velocity if EKF is ready and we have a velocity estimate
+        # Only update if EKF is ready
         if self.initialization_phase != 'ready' or self.ekf is None:
             return
-        # Use the follower's speed (in EKF state) and heading to set vfx, vfy
-        # Assume follower speed is stored in state[10] (vfx) and state[11] (vfy) as body-frame velocities
-        # We'll rotate the speed according to heading (0=N, 90=E, 180=S, 270=W)
-        speed = math.hypot(self.ekf.x[10], self.ekf.x[11])
-        heading_rad = math.radians(90 - self.current_heading_deg)  # Convert compass to math angle (0=E)
-        vx = speed * math.cos(heading_rad)
-        vy = speed * math.sin(heading_rad)
-        self.ekf.x[10] = vx
-        self.ekf.x[11] = vy
-        self.get_logger().debug(f'Heading update: heading={self.current_heading_deg:.2f} deg, vx={vx:.3f}, vy={vy:.3f}')
+        
+        # Perform EKF update with heading measurement
+        with self.lock:
+            self._update_heading_measurement(self.current_heading_deg)
+    
+    def _update_heading_measurement(self, heading_deg):
+        """Perform EKF update using heading measurement with proper Jacobians."""
+        # Convert heading to radians (NED: 0=N, 90=E)
+        heading_rad = math.radians(heading_deg)
+        
+        # Get current velocity estimates
+        vx = float(self.ekf.x[10])  # Velocity in UTM x (east)
+        vy = float(self.ekf.x[11])  # Velocity in UTM y (north)
+        
+        # Compute current speed
+        speed = math.sqrt(vx**2 + vy**2)
+        
+        # Avoid division by zero for very small speeds
+        if speed < 1e-6:
+            self.get_logger().debug('Speed too small for heading update, skipping')
+            return
+        
+        # Measurement model: heading = atan2(vx, vy) (NED convention: atan2(east, north))
+        # Expected measurement (predicted heading from current velocity)
+        predicted_heading = math.atan2(vx, vy)
+        
+        # Normalize angles to [-pi, pi]
+        def normalize_angle(angle):
+            while angle > math.pi:
+                angle -= 2 * math.pi
+            while angle < -math.pi:
+                angle += 2 * math.pi
+            return angle
+        
+        # Innovation (measurement residual)
+        innovation = np.array(normalize_angle(heading_rad - predicted_heading)).reshape(-1, 1)
+        
+        # Measurement Jacobian H (1x12 vector, only non-zero for velocity states)
+        H = np.zeros((1, 12), dtype=np.float32)
+        
+        # Partial derivatives of atan2(vx, vy) w.r.t. vx and vy
+        # d/dvx [atan2(vx, vy)] = vy / (vx^2 + vy^2)
+        # d/dvy [atan2(vx, vy)] = -vx / (vx^2 + vy^2)
+        speed_sq = vx**2 + vy**2
+        H[0, 10] = vy / speed_sq  # derivative w.r.t. vx (state index 10)
+        H[0, 11] = -vx / speed_sq  # derivative w.r.t. vy (state index 11)
+        
+        # Measurement noise covariance (heading uncertainty in radians)
+        R_heading = np.array([[math.radians(15.0)**2]], dtype=np.float32)  # 5 degree std dev
+        
+
+        # Kalman update equations
+        try:
+            # Innovation covariance
+            S = H @ self.ekf.P @ H.T + R_heading
+            
+            # Kalman gain
+            K = self.ekf.P @ H.T @ np.linalg.inv(S)            
+            # State update
+            self.ekf.x = self.ekf.x + K @ innovation
+            
+            # Covariance update (Joseph form for numerical stability)
+            I = np.eye(12, dtype=np.float32)
+            IKH = I - K @ H
+            self.ekf.P = IKH @ self.ekf.P
+            
+            # Apply velocity clipping
+            self.ekf._clip_velocities()
+            
+            self.get_logger().debug(f'Heading EKF update: measured={heading_deg:.1f}°, '
+                                  f'predicted={math.degrees(predicted_heading):.1f}°, '
+                                  f'innovation={math.degrees(innovation):.1f}°, '
+                                  f'updated_vx={float(self.ekf.x[10]):.3f}, '
+                                  f'updated_vy={float(self.ekf.x[11]):.3f}')
+            
+        except Exception as e:
+            self.get_logger().error(f'Heading EKF update failed: {e}')
 
     def imu_callback(self, msg):
         """Trigger EKF prediction step on IMU message."""
