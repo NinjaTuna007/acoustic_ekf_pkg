@@ -1,0 +1,16 @@
+<?xml version="1.0"?>
+<launch>
+    <!-- Declare arguments -->
+    <arg name="follower_ns" default="f1" description="Namespace for the follower (e.g., f1, f2, f3)"/>
+    <arg name="config_file" default="ekf_config_multi_follower.yaml" description="Config file to use"/>
+    
+    <!-- Launch EKF node with parameters -->
+    <node pkg="acoustic_ekf_pkg" 
+          exec="ekf_node" 
+          name="acoustic_ekf_$(var follower_ns)" 
+          output="screen">
+        <param name="use_sim_time" value="true"/>
+        <param name="config_file" value="$(var config_file)"/>
+        <param name="follower_ns" value="$(var follower_ns)"/>
+    </node>
+</launch>

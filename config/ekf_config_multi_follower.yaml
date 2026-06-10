@@ -1,0 +1,47 @@
+# Configuration for multi-follower acoustic EKF
+# Relative topic names (will be prefixed with follower namespace by the node)
+# Absolute topics (starting with /) are used as-is
+
+process_noise: 2.5
+measurement_noise: 2
+distance_measurement_noise: 1.5
+
+# Initialization parameters
+leader_init_samples: 1
+follower_init_samples: 1
+
+# Relative topic names (node will prepend follower namespace)
+publish_topic: 'ekf/state'
+geopoint_topic: 'ekf/geopoint'
+delta_pos_topic: 'ekf/delta_pos'
+dist1_topic: 'leader1/distance'
+dist2_topic: 'leader2/distance'
+follower_gps_topic: 'smarc/latlon'
+depth_topic: 'smarc/depth'
+imu_topic: 'core/imu'
+
+# Absolute topic names (shared across followers)
+gps1_topic: '/leader1/smarc/latlon'
+gps2_topic: '/leader2/smarc/latlon'
+
+# GPS type
+follower_gps_type: 'GeoPoint'
+
+# Other parameters
+max_speed: 500.0  # Maximum allowed speed for all vehicles (m/s)
+correction_factor: 0.9824  # 1473.6 / 1500 acoustic distance correction factor
+update_cooldown: 0  # Minimum seconds between EKF updates
+leader_gps_type: GeoPoint  # Using GeoPoint type for leaders
+leader_depth: 0.6  # Leaders operating depth
+
+# Heading updates disabled for multi-follower setup
+heading_measurement_noise: 5  # degrees (not used)
+heading_perturbation: 0  # degrees (not used)
+use_heading_updates: false  # Disabled - no heading measurements
+
+boat_offset: [0.0, -0.6]
+
+# Modem to baselink offset parameters
+modem_to_baselink_offset_x: 1.96
+modem_to_baselink_offset_y: 0.0
+modem_to_baselink_offset_z: 0.475

@@ -1,2 +1,5 @@
 # ignore pycache
 __pycache__/
+
+# ignore anything in the misc directory
+misc/

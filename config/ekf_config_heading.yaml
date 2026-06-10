@@ -1,7 +1,7 @@
 # General configuration for acoustic_ekf_pkg
-process_noise: 2.5
+process_noise: 4
 measurement_noise: 2
-distance_measurement_noise: 0.2  # if different, adjust; using same scale here
+distance_measurement_noise: 0.1  # if different, adjust; using same scale here
 
 # Initialization parameters
 leader_init_samples: 1
@@ -9,8 +9,7 @@ follower_init_samples: 1
 
 # ROS topic names for reading and publishing
 publish_topic: '/follower/ekf/state'
-geopoint_topic: '/follower/ekf/geopoint'
-delta_pos_topic: '/follower/ekf/delta_pos'
+geopoint_topic: '/follower/ekf_w_head/geopoint'
 dist1_topic: '/leader1/distance'
 dist2_topic: '/leader2/distance'
 gps1_topic: '/leader1/gps'
@@ -32,13 +31,6 @@ heading_measurement_noise: 5  # degrees
 heading_perturbation: 0  # degrees (+/- uniform)
 use_heading_updates: true # Toggle heading updates
 boat_offset: [0.0, -0.6]
-
-# Modem to baselink offset parameters (for real-time transform)
-# The EKF estimates modem position, we transform back to baselink for publishing
-modem_to_baselink_offset_x: 1.96  # Forward offset from baselink to modem (m)
-modem_to_baselink_offset_y: 0.0   # Lateral offset from baselink to modem (m)
-modem_to_baselink_offset_z: 0.475 # Vertical offset from baselink to modem (m)
-
 # You can add more parameters below as needed
 # Example:
 # initial_state: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]

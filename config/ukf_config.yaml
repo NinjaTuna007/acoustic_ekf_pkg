@@ -1,0 +1,69 @@
+# Configuration for the acoustic Unscented Kalman Filter (UKF) node.
+# Noise values use the latest calibration from misc/oceans_gl_real_expts.ipynb
+# (with-heading experiment): process_noise=4, measurement_noise=2,
+# distance_measurement_noise=0.1, heading_measurement_noise=10.
+
+# --- WNOA / measurement noise ---
+process_noise: 4                 # WNOA acceleration spectral density (m/s^2)
+measurement_noise: 2             # leader x/y pseudo-measurement std (m)
+distance_measurement_noise: 0.1  # acoustic range measurement std (m)
+
+# --- UKF unscented-transform tuning (Van der Merwe scaled UT) ---
+# alpha=1.0, kappa=0.0 gives lambda=0, which is numerically well-conditioned for
+# this 12-dimensional state. Avoid very small alpha here: it inflates the central
+# sigma weight and can break positive-definiteness of the covariance.
+ukf_alpha: 1.0
+ukf_beta: 2.0
+ukf_kappa: 0.0
+
+# --- Initialization ---
+leader_init_samples: 1
+follower_init_samples: 1
+
+# --- ROS topics (read + publish) ---
+publish_topic: '/follower/ukf/state'
+# NavSatFix outputs; '_leader1'/'_leader2'/'_centroid' are appended to this base.
+navsatfix_topic: '/follower/ukf/navsatfix'
+delta_pos_topic: '/follower/ukf/delta_pos'
+pose_cov_topic: '/follower/ukf/pose'      # PoseWithCovarianceStamped (UTM metres, frame 'utm')
+setpoint_topic: '/follower/ukf/setpoint'  # geographic_msgs/GeoPoint: desired follower position (behind leaders)
+dist1_topic: '/leader1/distance'
+dist2_topic: '/leader2/distance'
+gps1_topic: '/leader1/smarc/latlon'
+gps2_topic: '/leader2/smarc/latlon'
+follower_gps_topic: '/lolo/standard/navsatfix'
+follower_gps_type: 'NavSatFix'   # 'GeoPoint' or 'NavSatFix'
+leader_gps_type: 'GeoPoint'     # 'GeoPoint' or 'NavSatFix'
+imu_topic: '/lolo/standard/imu'
+depth_topic: '/lolo/smarc/depth'
+
+# --- Other parameters ---
+max_speed: 500.0                 # max allowed speed for all vehicles (m/s)
+correction_factor: 0.9824        # 1473.6 / 1500 acoustic sound-speed correction
+update_cooldown: 0               # min seconds between UKF measurement updates
+leader_depth: 1                  # leaders' operating depth (m)
+
+# --- Heading update ---
+# Disabled: the filter relies only on leader positions + acoustic ranges.
+# With this off, the node never subscribes to the heading topic and never runs
+# the heading update step.
+heading_measurement_noise: 10    # heading measurement std (degrees, unused)
+heading_perturbation: 0          # +/- uniform perturbation for robustness tests (degrees, unused)
+use_heading_updates: false       # toggle heading updates
+
+# Modem->baselink offset correction uses the heading ESTIMATED by the filter
+# (direction of the estimated follower velocity). Below this speed the velocity
+# direction is unreliable, so the last good heading estimate is reused.
+heading_min_speed: 0.2           # m/s
+
+# --- Setpoint generation ---
+# Bias toward leader 1's orientation estimate when deciding the "behind" side of
+# the leaders for the follower setpoint. Range [0, 1]: 0.5 = equal trust,
+# 1.0 = use leader 1 only.
+setpoint_leader1_weight: 0.7
+
+# --- Geometric offsets ---
+boat_offset: [0.0, -0.6]                  # antenna/GPS vs transducer offset (UTM m)
+modem_to_baselink_offset_x: 1.96          # forward offset from baselink to modem (m)
+modem_to_baselink_offset_y: 0.0           # lateral offset (m)
+modem_to_baselink_offset_z: 0.475         # vertical offset (m)

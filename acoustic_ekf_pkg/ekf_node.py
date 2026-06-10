@@ -30,7 +30,7 @@ class EKF:
         else:
             self.R = R if R is not None else np.eye(3, dtype=np.float32) * np.float32(0.05)
             
-        # State vector: [x1, y1, vx1, vy1, x2, y2, vx2, vy2, xf, yf, thetaf, vf]
+    # State vector: [x1, y1, vx1, vy1, x2, y2, vx2, vy2, xf, yf, vfx, vfy]
         self.x = initial_state.reshape((12, 1)).astype(np.float32)
         self.previous_x = self.x.copy()
         self.P = np.eye(12, dtype=np.float32) * 2
@@ -160,38 +160,78 @@ class AcousticEKFNode(Node):
     def __init__(self):
         super().__init__('acoustic_ekf_node')
         
-        # Load EKF config
-        config_path = os.path.join(os.path.dirname(__file__), '../config/ekf_config.yaml')
+        # Declare parameters
+        self.declare_parameter('config_file', 'ekf_config.yaml')
+        self.declare_parameter('follower_ns', '')
+        
+        # Get parameters
+        config_file = self.get_parameter('config_file').value
+        follower_ns = self.get_parameter('follower_ns').value
+        
+        # Load EKF config from specified file
+        config_path = os.path.join(os.path.dirname(__file__), '../config', config_file)
         with open(config_path, 'r') as f:
             config = yaml.safe_load(f)
-            
+
         # Configuration parameters
         process_noise = config.get('process_noise', 0.01)
         measurement_noise = config.get('measurement_noise', 0.05)
+        distance_measurement_noise = config.get('distance_measurement_noise', 0.1)  # Separate noise for distance
+        self.process_noise = process_noise  # store for dynamic Q updates
         self.leader_init_samples = config.get('leader_init_samples', 10)
         self.follower_init_samples = config.get('follower_init_samples', 3)
         self.max_speed = config.get('max_speed', 2.0)
-        self.dt = 0 # config.get('dt', 0.1)  # Read dt from config
+        self.dt = 0  # config.get('dt', 0.1)  # Read dt from config
         self.correction_factor = config.get('correction_factor', 1.0)  # Correction factor for distance measurements
+
+        # Boat (antenna / GPS vs transducer) offset in UTM meters [dx, dy]; applied to leader positions
+        self.boat_offset = np.array(config.get('boat_offset', [0.0, -0.6]), dtype=np.float32)
         
-        # Topic names from config
-        publish_topic = config.get('publish_topic', '/follower/ekf/state')
-        geopoint_topic = config.get('geopoint_topic', '/follower/ekf/geopoint')
-        dist1_topic = config.get('dist1_topic', '/follower/leader1/distance')
-        dist2_topic = config.get('dist2_topic', '/follower/leader2/distance')
-        gps1_topic = config.get('gps1_topic', '/follower/leader1/core/gps')
-        gps2_topic = config.get('gps2_topic', '/follower/leader2/core/gps')
-        follower_gps_topic = config.get('follower_gps_topic', '/follower/core/gps')
-        imu_topic = config.get('imu_topic', '/follower/core/imu')
+        # Modem to baselink offset parameters (for real-time transform)
+        # The EKF estimates modem position, we transform back to baselink for publishing
+        self.modem_to_baselink_offset_x = config.get('modem_to_baselink_offset_x', 1.96)  # Forward offset (m)
+        self.modem_to_baselink_offset_y = config.get('modem_to_baselink_offset_y', 0.0)   # Lateral offset (m) 
+        self.modem_to_baselink_offset_z = config.get('modem_to_baselink_offset_z', 0.475) # Vertical offset (m)
+        
+        # Heading update related parameters
+        self.heading_measurement_noise = config.get('heading_measurement_noise', 15.0)  # degrees
+        self.heading_perturbation = config.get('heading_perturbation', 0.0)  # degrees (+/- uniform)
+        self.use_heading_updates = config.get('use_heading_updates', True)
+        self.current_heading_deg = None  # Initialize current heading to None
+        
+        # Construct full topic paths from config (relative topics) and follower namespace
+        # If topic starts with '/', use as-is (absolute), otherwise prepend follower_ns
+        def build_topic(relative_topic):
+            if not relative_topic:
+                return ''
+            if relative_topic.startswith('/'):
+                return relative_topic  # Already absolute
+            if follower_ns:
+                return f'/{follower_ns}/{relative_topic}'
+            return f'/{relative_topic}'
+        
+        publish_topic = build_topic(config.get('publish_topic', 'follower/ekf/state'))
+        geopoint_topic = build_topic(config.get('geopoint_topic', 'follower/ekf/geopoint'))
+        dist1_topic = build_topic(config.get('dist1_topic', 'follower/leader1/distance'))
+        dist2_topic = build_topic(config.get('dist2_topic', 'follower/leader2/distance'))
+        gps1_topic = build_topic(config.get('gps1_topic', '/leader1/smarc/latlon'))
+        gps2_topic = build_topic(config.get('gps2_topic', '/leader2/smarc/latlon'))
+        follower_gps_topic = build_topic(config.get('follower_gps_topic', 'smarc/latlon'))
+        delta_pos_topic = build_topic(config.get('delta_pos_topic', 'ekf/delta_pos'))
+        imu_topic = build_topic(config.get('imu_topic', 'core/imu'))
         odom_topic = config.get('odom_topic', '/lolo/smarc/odom')
         leader_gps_type = config.get('leader_gps_type', 'NavSatFix')
         self.leader_gps_type = leader_gps_type
+        follower_gps_type = config.get('follower_gps_type', 'NavSatFix')
+        follower_gps_type = config.get('follower_gps_type', 'NavSatFix')
         
         # Publishers
         self.state_pub = self.create_publisher(Float32MultiArray, publish_topic, 10)
         self.geopoint_pub = self.create_publisher(NavSatFix, geopoint_topic, 10)  # Changed to NavSatFix
         self.geopoint_pub_leader1 = self.create_publisher(NavSatFix, geopoint_topic + "_leader1", 10)
         self.geopoint_pub_leader2 = self.create_publisher(NavSatFix, geopoint_topic + "_leader2", 10)
+        self.geopoint_pub_centroid = self.create_publisher(NavSatFix, geopoint_topic + "_centroid", 10)
+        self.delta_pos_pub = self.create_publisher(Float32, delta_pos_topic, 10)
         
         # Thread safety
         self.lock = threading.Lock()
@@ -205,6 +245,7 @@ class AcousticEKFNode(Node):
         self.follower_gps_samples = []
         self.initialization_phase = 'collecting_leaders'  # 'collecting_leaders', 'collecting_follower', 'ready'
         self.follower_utm_offset = None  # Offset in UTM coordinates for follower GPS
+        self.last_truth_follower_utm = None  # Absolute UTM of latest ground-truth follower GPS
         
         # Current measurements in UTM coordinates
         self.current_leader_positions = {1: None, 2: None}  # In UTM coordinates
@@ -224,18 +265,31 @@ class AcousticEKFNode(Node):
         else:
             self.create_subscription(NavSatFix, gps1_topic, self.gps1_callback, 10)
             self.create_subscription(NavSatFix, gps2_topic, self.gps2_callback, 10)
-        self.create_subscription(NavSatFix, follower_gps_topic, self.follower_gps_callback, 10)
+        
+        # Subscribe to follower GPS based on type
+        if follower_gps_type == 'GeoPoint':
+            from geographic_msgs.msg import GeoPoint
+            self.create_subscription(GeoPoint, follower_gps_topic, self.follower_gps_geopoint_callback, 10)
+        else:
+            self.create_subscription(NavSatFix, follower_gps_topic, self.follower_gps_callback, 10)
+        
         # self.create_subscription(Odometry, odom_topic, self.odom_callback, 10)  # <-- Commented out odom callback
         heading_topic = '/lolo/smarc/heading'
-        self.create_subscription(Float32, heading_topic, self.heading_callback, 10)
+        if self.use_heading_updates:
+            self.create_subscription(Float32, heading_topic, self.heading_callback, 10)
         self.create_subscription(Imu, imu_topic, self.imu_callback, 10)  # <-- Added IMU subscription
         
         # Timer for prediction step (DISABLED: prediction now triggered by GPS timestamps)
         # self.timer = self.create_timer(self.dt, self.timer_callback)
         
         # EKF matrices
-        self.Q = np.eye(12, dtype=np.float32) * np.float32(process_noise)
-        self.R = np.eye(3, dtype=np.float32) * np.float32(measurement_noise)
+        # Use WNOA-style block diagonal process noise (3 blocks of 4x4 for [x,y,vx,vy])
+        self.Q = self.make_WNOA(process_noise, dt=max(self.dt, 0.1))
+        # Measurement noise: first two (leader x,y) use measurement_noise^2, distance uses separate noise
+        self.R = np.eye(3, dtype=np.float32)
+        self.R[0, 0] = measurement_noise ** 2
+        self.R[1, 1] = measurement_noise ** 2
+        self.R[2, 2] = distance_measurement_noise ** 2
         
         self.update_cooldown = config.get('update_cooldown', 0.5)
         self.last_update_time = self.get_clock().now().nanoseconds / 1e9 - self.update_cooldown
@@ -243,7 +297,7 @@ class AcousticEKFNode(Node):
         self.get_logger().info('AcousticEKFNode initialized, collecting leader GPS samples...')
 
         self.leader_depth = config.get('leader_depth', 0.5)
-        depth_topic = config.get('depth_topic', '/lolo/smarc/depth')
+        depth_topic = build_topic(config.get('depth_topic', 'smarc/depth'))
         self.depth = None
         self.create_subscription(Float32, depth_topic, self.depth_callback, 10)
 
@@ -300,8 +354,8 @@ class AcousticEKFNode(Node):
         elif self.initialization_phase == 'ready':
             x, y = self.gps_to_utm(msg.latitude, msg.longitude)
             if x is not None and y is not None and self.follower_utm_offset is not None:
-                offset_x = x - self.follower_utm_offset[0]
-                offset_y = y - self.follower_utm_offset[1]
+                offset_x = x - self.follower_utm_offset[0] - self.boat_offset[0]
+                offset_y = y - self.follower_utm_offset[1] - self.boat_offset[1]
                 self.current_leader_positions[1] = (offset_x, offset_y)
                 self.get_logger().info(f'Updated current_leader_positions[1] to ({offset_x:.2f}, {offset_y:.2f}) [offset applied]')
             else:
@@ -318,8 +372,8 @@ class AcousticEKFNode(Node):
         elif self.initialization_phase == 'ready':
             x, y = self.gps_to_utm(msg.latitude, msg.longitude)
             if x is not None and y is not None and self.follower_utm_offset is not None:
-                offset_x = x - self.follower_utm_offset[0]
-                offset_y = y - self.follower_utm_offset[1]
+                offset_x = x - self.follower_utm_offset[0] - self.boat_offset[0]
+                offset_y = y - self.follower_utm_offset[1] - self.boat_offset[1]
                 self.current_leader_positions[2] = (offset_x, offset_y)
                 self.get_logger().info(f'Updated current_leader_positions[2] to ({offset_x:.2f}, {offset_y:.2f}) [offset applied]')
             else:
@@ -328,30 +382,34 @@ class AcousticEKFNode(Node):
     def gps1_geopoint_callback(self, msg):
         """Handle GeoPoint data from leader 1"""
         lat, lon = msg.latitude, msg.longitude
-        self.get_logger().info(f'Received GPS1 (GeoPoint): lat={lat:.6f}, lon={lon:.6f}')
+        self.get_logger().debug(f'Received GPS1 (GeoPoint): lat={lat:.6f}, lon={lon:.6f}')
         if self.initialization_phase == 'collecting_leaders':
             self.leader_gps_samples[1].append((lat, lon))
             self.get_logger().info(f'Leader 1 GPS sample {len(self.leader_gps_samples[1])}/{self.leader_init_samples}: lat={lat:.6f}, lon={lon:.6f}')
             self._check_leader_initialization()
         elif self.initialization_phase == 'ready':
             x, y = self.gps_to_utm(lat, lon)
-            if x is not None and y is not None:
-                self.current_leader_positions[1] = (x, y)
-                self.get_logger().info(f'Updated current_leader_positions[1] to ({x:.2f}, {y:.2f})')
+            if x is not None and y is not None and self.follower_utm_offset is not None:
+                offset_x = x - self.follower_utm_offset[0] - self.boat_offset[0]
+                offset_y = y - self.follower_utm_offset[1] - self.boat_offset[1]
+                self.current_leader_positions[1] = (offset_x, offset_y)
+                self.get_logger().debug(f'Updated current_leader_positions[1] to ({offset_x:.2f}, {offset_y:.2f}) [offset applied]')
 
     def gps2_geopoint_callback(self, msg):
         """Handle GeoPoint data from leader 2"""
         lat, lon = msg.latitude, msg.longitude
-        self.get_logger().info(f'Received GPS2 (GeoPoint): lat={lat:.6f}, lon={lon:.6f}')
+        self.get_logger().debug(f'Received GPS2 (GeoPoint): lat={lat:.6f}, lon={lon:.6f}')
         if self.initialization_phase == 'collecting_leaders':
             self.leader_gps_samples[2].append((lat, lon))
             self.get_logger().info(f'Leader 2 GPS sample {len(self.leader_gps_samples[2])}/{self.leader_init_samples}: lat={lat:.6f}, lon={lon:.6f}')
             self._check_leader_initialization()
         elif self.initialization_phase == 'ready':
             x, y = self.gps_to_utm(lat, lon)
-            if x is not None and y is not None:
-                self.current_leader_positions[2] = (x, y)
-                self.get_logger().info(f'Updated current_leader_positions[2] to ({x:.2f}, {y:.2f})')
+            if x is not None and y is not None and self.follower_utm_offset is not None:
+                offset_x = x - self.follower_utm_offset[0] - self.boat_offset[0]
+                offset_y = y - self.follower_utm_offset[1] - self.boat_offset[1]
+                self.current_leader_positions[2] = (offset_x, offset_y)
+                self.get_logger().debug(f'Updated current_leader_positions[2] to ({offset_x:.2f}, {offset_y:.2f}) [offset applied]')
 
     def follower_gps_callback(self, msg):
         """Handle GPS data from follower for initialization and trigger EKF prediction with variable dt"""
@@ -370,14 +428,69 @@ class AcousticEKFNode(Node):
                 dt = t - self.last_predict_time
                 if dt > 0:
                     with self.lock:
+                        # Update latest ground-truth UTM position
+                        gx, gy = self.gps_to_utm(msg.latitude, msg.longitude)
+                        if gx is not None and gy is not None:
+                            self.last_truth_follower_utm = (gx, gy)
                         self.ekf.dt = np.float32(dt)
+                        # Update dynamic process noise matrix with new dt
+                        self.ekf.Q = self.make_WNOA(self.process_noise, dt)
                         self.ekf.predict()
                         self._publish_state_and_geopoint()
             self.last_predict_time = t
+        # Also update truth position even if not ready for prediction
+        else:
+            gx, gy = self.gps_to_utm(msg.latitude, msg.longitude)
+            if gx is not None and gy is not None:
+                self.last_truth_follower_utm = (gx, gy)
+
+    def follower_gps_geopoint_callback(self, msg):
+        """Handle GeoPoint GPS data from follower for initialization and trigger EKF prediction"""
+        lat, lon = msg.latitude, msg.longitude
+        self.get_logger().debug(f'Received follower GPS (GeoPoint): lat={lat:.6f}, lon={lon:.6f}')
+        
+        # Use ROS time consistently (convert to float seconds)
+        t = self.get_clock().now().nanoseconds / 1e9
+        
+        if self.initialization_phase == 'collecting_follower':
+            self.follower_gps_samples.append((lat, lon))
+            self.get_logger().info(f'Follower GPS sample {len(self.follower_gps_samples)}/{self.follower_init_samples}: '
+                                   f'lat={lat:.6f}, lon={lon:.6f}')
+            if len(self.follower_gps_samples) >= self.follower_init_samples:
+                self._initialize_ekf()
+                # Initialize time tracking after EKF is ready
+                self.last_predict_time = t
+        elif self.initialization_phase == 'ready' and self.ekf is not None:
+            # Compute dt from ROS time between message arrivals
+            if self.last_predict_time is not None:
+                dt = t - self.last_predict_time
+                # Sanity check dt (should be between 0.01s and 2s for GPS updates)
+                if dt > 0.01 and dt < 2.0:
+                    with self.lock:
+                        # Update latest ground-truth UTM position
+                        gx, gy = self.gps_to_utm(lat, lon)
+                        if gx is not None and gy is not None:
+                            self.last_truth_follower_utm = (gx, gy)
+                        self.ekf.dt = np.float32(dt)
+                        # Update dynamic process noise matrix with measured dt
+                        self.ekf.Q = self.make_WNOA(self.process_noise, dt)
+                        self.ekf.predict()
+                        self._publish_state_and_geopoint()
+                elif dt >= 2.0:
+                    self.get_logger().warn(f'Large dt gap: {dt:.3f}s, skipping prediction')
+            else:
+                # First prediction after initialization
+                self.get_logger().info('First GeoPoint after init, waiting for next message to compute dt')
+            self.last_predict_time = t
+        # Also update truth position
+        else:
+            gx, gy = self.gps_to_utm(lat, lon)
+            if gx is not None and gy is not None:
+                self.last_truth_follower_utm = (gx, gy)
 
     def dist1_callback(self, msg):
         """Handle distance measurement from leader 1"""
-        self.get_logger().info(f'Received distance from leader 1: {msg.data:.2f}')
+        self.get_logger().debug(f'Received distance from leader 1: {msg.data:.2f}')
         if self.initialization_phase != 'ready':
             self.get_logger().info('dist1_callback ignored: not ready')
             return
@@ -411,7 +524,7 @@ class AcousticEKFNode(Node):
 
     def dist2_callback(self, msg):
         """Handle distance measurement from leader 2"""
-        self.get_logger().info(f'Received distance from leader 2: {msg.data:.2f}')
+        self.get_logger().debug(f'Received distance from leader 2: {msg.data:.2f}')
         if self.initialization_phase != 'ready':
             self.get_logger().info('dist2_callback ignored: not ready')
             return
@@ -445,7 +558,14 @@ class AcousticEKFNode(Node):
 
     def heading_callback(self, msg):
         """EKF update using heading measurement with proper Jacobians."""
-        self.current_heading_deg = msg.data
+        if not self.use_heading_updates:
+            return
+        eps = float(self.heading_perturbation)
+        if eps > 0:
+            perturb = np.random.uniform(-eps, eps)
+        else:
+            perturb = 0.0
+        self.current_heading_deg = msg.data + perturb  # Optional perturbation for robustness testing
         # Only update if EKF is ready
         if self.initialization_phase != 'ready' or self.ekf is None:
             return
@@ -497,9 +617,8 @@ class AcousticEKFNode(Node):
         H[0, 11] = -vx / speed_sq  # derivative w.r.t. vy (state index 11)
         
         # Measurement noise covariance (heading uncertainty in radians)
-        R_heading = np.array([[math.radians(15.0)**2]], dtype=np.float32)  # 5 degree std dev
+        R_heading = np.array([[math.radians(self.heading_measurement_noise)**2]], dtype=np.float32)
         
-
         # Kalman update equations
         try:
             # Innovation covariance
@@ -516,7 +635,7 @@ class AcousticEKFNode(Node):
             self.ekf.P = IKH @ self.ekf.P
             
             # Apply velocity clipping
-            self.ekf._clip_velocities()
+            # self.ekf._clip_velocities()
             
             self.get_logger().debug(f'Heading EKF update: measured={heading_deg:.1f}°, '
                                   f'predicted={math.degrees(predicted_heading):.1f}°, '
@@ -538,6 +657,8 @@ class AcousticEKFNode(Node):
             if dt > 0:
                 with self.lock:
                     self.ekf.dt = np.float32(dt)
+                    # Update dynamic process noise matrix with new dt
+                    self.ekf.Q = self.make_WNOA(self.process_noise, dt)
                     self.ekf.predict()
                     self._publish_state_and_geopoint()
         self.last_predict_time = t
@@ -595,10 +716,15 @@ class AcousticEKFNode(Node):
             return
         # Store follower UTM offset for later use
         self.follower_utm_offset = np.array([follower_x, follower_y], dtype=np.float64)
-        # Initialize EKF state vector: [x1, y1, vx1, vy1, x2, y2, vx2, vy2, xf, yf, thetaf, vf]
+        # Apply boat offset to leader positions (subtracting so that we add back when publishing)
+        leader1_x_adj = leader1_x - self.boat_offset[0]
+        leader1_y_adj = leader1_y - self.boat_offset[1]
+        leader2_x_adj = leader2_x - self.boat_offset[0]
+        leader2_y_adj = leader2_y - self.boat_offset[1]
+        # Initialize EKF state vector: [x1, y1, vx1, vy1, x2, y2, vx2, vy2, xf, yf, vfx, vfy]
         initial_state = np.array([
-            leader1_x - follower_x, leader1_y - follower_y, 0.0, 0.0,  # Leader 1 position and velocity (offset)
-            leader2_x - follower_x, leader2_y - follower_y, 0.0, 0.0,  # Leader 2 position and velocity (offset)
+            leader1_x_adj - follower_x, leader1_y_adj - follower_y, 0.0, 0.0,  # Leader 1 (offset & boat adjustment)
+            leader2_x_adj - follower_x, leader2_y_adj - follower_y, 0.0, 0.0,  # Leader 2 (offset & boat adjustment)
             0.0, 0.0, 0.0, 0.0 # Follower position and velocity (origin)
         ], dtype=np.float32)
         self.ekf = EKF(initial_state, Q=self.Q, R=self.R, dt=self.dt, max_velocity=self.max_speed)
@@ -617,8 +743,24 @@ class AcousticEKFNode(Node):
         state_msg.data = state.tolist()
         self.state_pub.publish(state_msg)
         # Add offset back for publishing
-        follower_x = state[8] + self.follower_utm_offset[0]
-        follower_y = state[9] + self.follower_utm_offset[1]
+        follower_modem_x = state[8] + self.follower_utm_offset[0]
+        follower_modem_y = state[9] + self.follower_utm_offset[1]
+        
+        # Apply reverse transform from modem position to baselink position
+        # The EKF estimates modem position, but we want to publish baselink position
+        if hasattr(self, 'current_heading_deg') and self.current_heading_deg is not None:
+            # Convert heading to radians (NED convention: 0=North, 90=East)
+            heading_rad = math.radians(self.current_heading_deg)
+            
+            # Reverse transform: baselink = modem - offset * [sin(heading), cos(heading)]
+            # This undoes the offset applied in post-processing
+            follower_x = follower_modem_x - self.modem_to_baselink_offset_x * math.sin(heading_rad)
+            follower_y = follower_modem_y - self.modem_to_baselink_offset_x * math.cos(heading_rad)
+        else:
+            # If no heading available, publish modem position (fallback)
+            self.get_logger().warn('No heading available for modem-to-baselink transform, publishing modem position', throttle_duration_sec=5.0)
+            follower_x = follower_modem_x
+            follower_y = follower_modem_y
         # Sanity check for out-of-range UTM values
         if abs(follower_x) > 1e7 or abs(follower_y) > 1e7:
             self.get_logger().warn(f'Follower UTM values out of range: x={follower_x}, y={follower_y}. Skipping publish.')
@@ -634,9 +776,16 @@ class AcousticEKFNode(Node):
             navsat_msg.status.status = 0
             navsat_msg.status.service = 1
             self.geopoint_pub.publish(navsat_msg)
+        # Publish delta distance to ground truth if available
+        if self.last_truth_follower_utm is not None:
+            truth_x, truth_y = self.last_truth_follower_utm
+            delta = math.sqrt((follower_x - truth_x)**2 + (follower_y - truth_y)**2)
+            delta_msg = Float32()
+            delta_msg.data = float(delta)
+            self.delta_pos_pub.publish(delta_msg)
         # Leader 1 position
-        leader1_x = state[0] + self.follower_utm_offset[0]
-        leader1_y = state[1] + self.follower_utm_offset[1]
+        leader1_x = state[0] + self.follower_utm_offset[0] + self.boat_offset[0]
+        leader1_y = state[1] + self.follower_utm_offset[1] + self.boat_offset[1]
         if abs(leader1_x) > 1e7 or abs(leader1_y) > 1e7:
             self.get_logger().warn(f'Leader1 UTM values out of range: x={leader1_x}, y={leader1_y}. Skipping publish.')
         else:
@@ -652,8 +801,8 @@ class AcousticEKFNode(Node):
                 navsat_leader1.status.service = 1
                 self.geopoint_pub_leader1.publish(navsat_leader1)
         # Leader 2 position
-        leader2_x = state[4] + self.follower_utm_offset[0]
-        leader2_y = state[5] + self.follower_utm_offset[1]
+        leader2_x = state[4] + self.follower_utm_offset[0] + self.boat_offset[0]
+        leader2_y = state[5] + self.follower_utm_offset[1] + self.boat_offset[1]
         if abs(leader2_x) > 1e7 or abs(leader2_y) > 1e7:
             self.get_logger().warn(f'Leader2 UTM values out of range: x={leader2_x}, y={leader2_y}. Skipping publish.')
         else:
@@ -668,6 +817,44 @@ class AcousticEKFNode(Node):
                 navsat_leader2.status.status = 0
                 navsat_leader2.status.service = 1
                 self.geopoint_pub_leader2.publish(navsat_leader2)
+        
+        # Publish centroid of all three positions
+        if (follower_lat is not None and follower_lon is not None and
+            abs(leader1_x) <= 1e7 and abs(leader1_y) <= 1e7 and
+            abs(leader2_x) <= 1e7 and abs(leader2_y) <= 1e7):
+            
+            # Calculate centroid in UTM coordinates
+            centroid_x = (follower_x + leader1_x + leader2_x) / 3.0
+            centroid_y = (follower_y + leader1_y + leader2_y) / 3.0
+            
+            centroid_lat, centroid_lon = self.utm_to_gps(centroid_x, centroid_y)
+            if centroid_lat is not None and centroid_lon is not None:
+                navsat_centroid = NavSatFix()
+                navsat_centroid.latitude = centroid_lat
+                navsat_centroid.longitude = centroid_lon
+                navsat_centroid.altitude = 0.0
+                navsat_centroid.header.stamp = self.get_clock().now().to_msg()
+                navsat_centroid.header.frame_id = "map"
+                navsat_centroid.status.status = 0
+                navsat_centroid.status.service = 1
+                self.geopoint_pub_centroid.publish(navsat_centroid)
+
+    def make_WNOA(self, process_noise, dt):
+        """Create block diagonal WNOA process noise matrix (3 x 4x4 blocks for [x,y,vx,vy])."""
+        dt = float(max(dt, 1e-3))  # guard against zero
+        dt2 = dt * dt
+        dt3 = dt2 * dt
+        dt4 = dt3 * dt
+        block = (process_noise ** 2) * np.array([
+            [dt4 / 4, 0, dt3 / 2, 0],
+            [0, dt4 / 4, 0, dt3 / 2],
+            [dt3 / 2, 0, dt2, 0],
+            [0, dt3 / 2, 0, dt2]
+        ], dtype=np.float32)
+        Q = np.zeros((12, 12), dtype=np.float32)
+        for i in range(3):
+            Q[i*4:(i+1)*4, i*4:(i+1)*4] = block
+        return Q
 
 
 def main(args=None):
