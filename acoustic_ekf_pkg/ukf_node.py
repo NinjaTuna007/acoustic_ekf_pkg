@@ -275,8 +275,10 @@ class AcousticUKFNode(Node):
         config_file = self.get_parameter('config_file').value
         follower_ns = self.get_parameter('follower_ns').value
 
-        # Load UKF config from specified file
-        config_path = os.path.join(os.path.dirname(__file__), '../config', config_file)
+        # Load UKF config, resolving the path robustly (installed share dir,
+        # source tree, or an absolute path given via the parameter).
+        config_path = self._resolve_config_path(config_file)
+        self.get_logger().info(f'Loading config from: {config_path}')
         with open(config_path, 'r') as f:
             config = yaml.safe_load(f)
 
@@ -429,6 +431,30 @@ class AcousticUKFNode(Node):
         self.set_parameters([rclpy.parameter.Parameter('use_sim_time', rclpy.Parameter.Type.BOOL, True)])
 
         self.get_logger().info('AcousticUKFNode initialized, collecting leader GPS samples...')
+
+    def _resolve_config_path(self, config_file):
+        """Locate the config YAML across install and source layouts.
+
+        Tries, in order: an absolute path; the installed package share dir
+        (proper ROS location); and the source tree relative to this file.
+        """
+        if os.path.isabs(config_file):
+            return config_file
+
+        candidates = []
+        try:
+            from ament_index_python.packages import get_package_share_directory
+            candidates.append(os.path.join(
+                get_package_share_directory('acoustic_ekf_pkg'), 'config', config_file))
+        except Exception:
+            pass
+        candidates.append(os.path.join(os.path.dirname(__file__), '../config', config_file))
+
+        for path in candidates:
+            if os.path.exists(path):
+                return path
+        # Nothing found: return the best candidate so the error names a real path.
+        return candidates[0]
 
     # ----------------------------------------------------------- UTM helpers
     def gps_to_utm(self, lat, lon):
