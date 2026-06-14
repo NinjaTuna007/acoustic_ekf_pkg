@@ -4,9 +4,13 @@
 # distance_measurement_noise=0.1, heading_measurement_noise=10.
 
 # --- WNOA / measurement noise ---
-process_noise: 4                 # WNOA acceleration spectral density (m/s^2)
-measurement_noise: 2             # leader x/y pseudo-measurement std (m)
-distance_measurement_noise: 0.1  # acoustic range measurement std (m)
+# Tuned on the ukf_test_4 field bag (follower stationary, leaders live): the
+# follower estimate stays within ~6 m of truth and ends on it. Note: too-tight
+# distance_measurement_noise (<0.3) re-introduces instability (over-trusts the
+# ambiguous range), so keep it >= 0.5.
+process_noise: 2.0                 # WNOA acceleration spectral density (m/s^2)
+measurement_noise: 0.5             # leader x/y pseudo-measurement std (m)
+distance_measurement_noise: 1.0    # acoustic range measurement std (m)
 
 # --- UKF unscented-transform tuning (Van der Merwe scaled UT) ---
 # alpha=1.0, kappa=0.0 gives lambda=0, which is numerically well-conditioned for
@@ -38,10 +42,17 @@ imu_topic: '/lolo/standard/imu'
 depth_topic: '/lolo/smarc/depth'
 
 # --- Other parameters ---
-max_speed: 500.0                 # max allowed speed for all vehicles (m/s)
-correction_factor: 0.9824        # 1473.6 / 1500 acoustic sound-speed correction
+max_speed: 3.0                 # max allowed speed for all vehicles (m/s)
+correction_factor: 1.0        # multiplicative acoustic sound-speed correction
+# Constant range-bias correction (m) ADDED to every acoustic range, to de-bias
+# the raw OWTT measurement (clock-sync / sound-speed offset). On ukf_test_4 the
+# raw ranges read ~3-3.5 m short, so +3.45 m centres the estimate on truth.
+# IMPORTANT: this is a single GLOBAL value applied to both leaders. Do NOT use
+# different per-leader biases: that makes the two ranges geometrically
+# inconsistent and destabilises the filter.
+range_bias: 0.0
 update_cooldown: 0               # min seconds between UKF measurement updates
-leader_depth: 1                  # leaders' operating depth (m)
+leader_depth: 0.5                  # leaders' operating depth (m)
 
 # --- Heading update ---
 # Disabled: the filter relies only on leader positions + acoustic ranges.
@@ -63,7 +74,8 @@ heading_min_speed: 0.2           # m/s
 setpoint_leader1_weight: 0.7
 
 # --- Geometric offsets ---
-boat_offset: [0.0, -0.6]                  # antenna/GPS vs transducer offset (UTM m)
+boat_offset: [0.0, 0.0]                  # antenna/GPS vs transducer offset (UTM m)
 modem_to_baselink_offset_x: 1.96          # forward offset from baselink to modem (m)
 modem_to_baselink_offset_y: 0.0           # lateral offset (m)
-modem_to_baselink_offset_z: 0.475         # vertical offset (m)
+# modem_to_baselink_offset_z: 0.475         # vertical offset (m)
+modem_to_baselink_offset_z: -1.0         # vertical offset (m)

@@ -194,25 +194,44 @@ class UKF:
         return self.x.flatten(), self.P
 
     def update(self, z, leader_id):
-        """Range/position update for the given leader (z = [lx, ly, dist])."""
+        """Range/position update for the given leader (z = [lx, ly, dist]).
+
+        This step uses an EXTENDED-Kalman (analytic Jacobian) update rather than
+        the unscented form. The acoustic range ``dist = ||leader - follower||`` is
+        nonlinear AND ambiguous: two leaders give a two-circle intersection with a
+        mirror solution. The unscented transform spreads sigma points by
+        ``sqrt(N + lambda) * sqrt(P)`` (~5-7 m here), which straddles both
+        branches; the resulting mean/cross-covariance get contaminated by the
+        mirror solution and walk the follower onto the wrong (ghost) intersection,
+        especially under the degenerate same-direction leader geometry seen in the
+        field data. The EKF linearises locally, so the update always steps along
+        the local gradient and stays on the correct branch. The constant-velocity
+        prediction remains unscented (it is exact for a linear model).
+        """
         z = np.asarray(z, dtype=np.float64).flatten()
-        sigmas = self._sigma_points()
-        Zsig = np.array([self._hx_leader(s, leader_id) for s in sigmas])
+        fx = self.x.flatten()
+        lx = fx[leader_id * 4]
+        ly = fx[leader_id * 4 + 1]
+        xf = fx[8]
+        yf = fx[9]
+        dist = math.hypot(lx - xf, ly - yf)
+        if dist < 1e-6:
+            dist = 1e-6
 
-        zmean = self.Wm @ Zsig
-        m = z.shape[0]
-        S = self.R.copy()
-        Cxz = np.zeros((self.N, m))
-        xmean = self.x.flatten()
-        for i in range(Zsig.shape[0]):
-            dz = (Zsig[i] - zmean).reshape(-1, 1)
-            dx = (sigmas[i] - xmean).reshape(-1, 1)
-            S += self.Wc[i] * (dz @ dz.T)
-            Cxz += self.Wc[i] * (dx @ dz.T)
+        # Measurement Jacobian H (3 x N) for h(x) = [lx, ly, ||leader-follower||].
+        H = np.zeros((3, self.N), dtype=np.float64)
+        H[0, leader_id * 4] = 1.0
+        H[1, leader_id * 4 + 1] = 1.0
+        H[2, leader_id * 4] = (lx - xf) / dist
+        H[2, leader_id * 4 + 1] = (ly - yf) / dist
+        H[2, 8] = (xf - lx) / dist
+        H[2, 9] = (yf - ly) / dist
 
-        K = Cxz @ np.linalg.inv(S)
-        self.x = self.x + K @ (z - zmean).reshape(-1, 1)
-        self.P = self.P - K @ S @ K.T
+        S = H @ self.P @ H.T + self.R
+        K = self.P @ H.T @ np.linalg.inv(S)
+        zhat = np.array([lx, ly, dist])
+        self.x = self.x + K @ (z - zhat).reshape(-1, 1)
+        self.P = (np.eye(self.N) - K @ H) @ self.P
         self._symmetrize()
         self._clip_velocities()
         return self.x.flatten()
@@ -292,6 +311,11 @@ class AcousticUKFNode(Node):
         self.max_speed = config.get('max_speed', 500.0)
         self.dt = 0
         self.correction_factor = config.get('correction_factor', 0.9824)
+        # Constant range-bias correction (metres) added to every acoustic range
+        # to de-bias the OWTT measurement (e.g. clock-sync / sound-speed offset).
+        # Use a single global value: different per-leader biases make the two
+        # ranges geometrically inconsistent and destabilise the filter.
+        self.range_bias = float(config.get('range_bias', 0.0))
 
         # Boat (antenna/GPS vs transducer) offset in UTM metres [dx, dy].
         self.boat_offset = np.array(config.get('boat_offset', [0.0, -0.6]), dtype=np.float32)
@@ -398,9 +422,11 @@ class AcousticUKFNode(Node):
         else:
             self.create_subscription(NavSatFix, follower_gps_topic, self.follower_gps_callback, 10)
 
+        # Always subscribe to the follower heading so we can place the modem
+        # correctly at initialization (and, if enabled, run heading updates).
+        self.follower_heading_deg = None
         heading_topic = '/lolo/smarc/heading'
-        if self.use_heading_updates:
-            self.create_subscription(Float32, heading_topic, self.heading_callback, 10)
+        self.create_subscription(Float32, heading_topic, self.heading_callback, 10)
         self.create_subscription(Imu, imu_topic, self.imu_callback, 10)
 
         # Noise matrices.
@@ -573,7 +599,7 @@ class AcousticUKFNode(Node):
             if now - self.last_update_time < self.update_cooldown:
                 return
             d = raw_distance * self.correction_factor
-            self.last_distances[leader_id] = self._horizontal_distance(d)
+            self.last_distances[leader_id] = self._horizontal_distance(d) + self.range_bias
             if self.current_leader_positions[leader_id] is not None:
                 z = np.array([
                     self.current_leader_positions[leader_id][0],
@@ -593,12 +619,18 @@ class AcousticUKFNode(Node):
 
     # ----------------------------------------------------------- heading
     def heading_callback(self, msg):
-        """Heading measurement -> UKF heading update."""
-        if not self.use_heading_updates:
-            return
+        """Store the latest follower heading; optionally run a UKF heading update.
+
+        The heading is always recorded (used to place the follower modem relative
+        to the GPS/baselink origin at initialization). The heading *update* step
+        only runs when ``use_heading_updates`` is enabled.
+        """
         eps = float(self.heading_perturbation)
         perturb = np.random.uniform(-eps, eps) if eps > 0 else 0.0
-        self.current_heading_deg = msg.data + perturb
+        self.follower_heading_deg = msg.data + perturb
+        if not self.use_heading_updates:
+            return
+        self.current_heading_deg = self.follower_heading_deg
         if self.initialization_phase != 'ready' or self.ukf is None:
             return
         with self.lock:
@@ -662,11 +694,31 @@ class AcousticUKFNode(Node):
         leader2_x_adj = leader2_x - self.boat_offset[0]
         leader2_y_adj = leader2_y - self.boat_offset[1]
 
+        # Place the follower MODEM (the acoustic-range endpoint) relative to the
+        # follower's GPS/baselink origin using the known compass heading. The
+        # follower state tracks the modem, but the GPS origin is the baselink, so
+        # without this the state would start ~modem_to_baselink_offset_x metres
+        # off and have to drift to reconcile with the ranges. NED heading
+        # (0=North, 90=East): forward (body +x) -> [E, N] = [sin h, cos h];
+        # starboard (body +y) -> [cos h, -sin h].
+        xf0 = yf0 = 0.0
+        if self.follower_heading_deg is not None:
+            h = math.radians(self.follower_heading_deg)
+            ox = self.modem_to_baselink_offset_x
+            oy = self.modem_to_baselink_offset_y
+            xf0 = ox * math.sin(h) + oy * math.cos(h)
+            yf0 = ox * math.cos(h) - oy * math.sin(h)
+            self.get_logger().info(
+                f'Init follower modem offset from heading {self.follower_heading_deg:.1f} deg: '
+                f'({xf0:.2f}, {yf0:.2f}) m')
+        else:
+            self.get_logger().warn('No follower heading at init; modem placed at baselink origin')
+
         # State: [x1, y1, vx1, vy1, x2, y2, vx2, vy2, xf, yf, vfx, vfy]
         initial_state = np.array([
             leader1_x_adj - follower_x, leader1_y_adj - follower_y, 0.0, 0.0,
             leader2_x_adj - follower_x, leader2_y_adj - follower_y, 0.0, 0.0,
-            0.0, 0.0, 0.0, 0.0,
+            xf0, yf0, 0.0, 0.0,
         ], dtype=np.float32)
 
         self.ukf = UKF(initial_state, Q=self.Q, R=self.R, dt=self.dt,
