@@ -163,6 +163,9 @@ class AcousticEKFNode(Node):
         # Declare parameters
         self.declare_parameter('config_file', 'ekf_config.yaml')
         self.declare_parameter('follower_ns', '')
+        # use_sim_time is often pre-declared by launch; default live=false.
+        if not self.has_parameter('use_sim_time'):
+            self.declare_parameter('use_sim_time', False)
         
         # Get parameters
         config_file = self.get_parameter('config_file').value
@@ -309,8 +312,10 @@ class AcousticEKFNode(Node):
 
         self.last_predict_time = None  # For variable dt prediction
 
-        # Set use_sim_time parameter
-        self.set_parameters([rclpy.parameter.Parameter('use_sim_time', rclpy.Parameter.Type.BOOL, True)])
+        # use_sim_time is a declared ROS param; bag launches pass true explicitly.
+        self.get_logger().info(
+            f'AcousticEKFNode initialized (use_sim_time='
+            f'{bool(self.get_parameter("use_sim_time").value)})')
 
     def gps_to_utm(self, lat, lon):
         """Convert GPS to UTM coordinates, establishing reference zone from first conversion, with higher precision."""

@@ -290,6 +290,9 @@ class AcousticUKFNode(Node):
         # Declare parameters
         self.declare_parameter('config_file', 'ukf_config.yaml')
         self.declare_parameter('follower_ns', '')
+        # use_sim_time is often pre-declared by launch; default live=false.
+        if not self.has_parameter('use_sim_time'):
+            self.declare_parameter('use_sim_time', False)
 
         config_file = self.get_parameter('config_file').value
         follower_ns = self.get_parameter('follower_ns').value
@@ -370,7 +373,6 @@ class AcousticUKFNode(Node):
         delta_pos_topic = build_topic(config.get('delta_pos_topic', 'ukf/delta_pos'))
         pose_cov_topic = build_topic(config.get('pose_cov_topic', 'follower/ukf/pose'))
         setpoint_topic = build_topic(config.get('setpoint_topic', 'follower/ukf/setpoint'))
-        imu_topic = build_topic(config.get('imu_topic', 'core/imu'))
         leader_gps_type = config.get('leader_gps_type', 'NavSatFix')
         self.leader_gps_type = leader_gps_type
         follower_gps_type = config.get('follower_gps_type', 'NavSatFix')
@@ -422,12 +424,22 @@ class AcousticUKFNode(Node):
         else:
             self.create_subscription(NavSatFix, follower_gps_topic, self.follower_gps_callback, 10)
 
-        # Always subscribe to the follower heading so we can place the modem
-        # correctly at initialization (and, if enabled, run heading updates).
+        # Heading: optional external compass. Empty heading_topic skips the sub;
+        # sticks typically leave this empty and rely on velocity-derived heading.
         self.follower_heading_deg = None
-        heading_topic = '/lolo/smarc/heading'
-        self.create_subscription(Float32, heading_topic, self.heading_callback, 10)
-        self.create_subscription(Imu, imu_topic, self.imu_callback, 10)
+        heading_topic = config.get('heading_topic', '/lolo/smarc/heading')
+        if heading_topic:
+            heading_topic = build_topic(heading_topic)
+            self.create_subscription(Float32, heading_topic, self.heading_callback, 10)
+            self.get_logger().info(f'Subscribed to heading on {heading_topic}')
+
+        imu_topic = config.get('imu_topic', 'core/imu')
+        if imu_topic:
+            imu_topic = build_topic(imu_topic)
+            self.create_subscription(Imu, imu_topic, self.imu_callback, 10)
+            self.get_logger().info(f'Subscribed to IMU on {imu_topic}')
+        else:
+            self.get_logger().info('imu_topic empty; IMU predict disabled (GPS-driven predict only)')
 
         # Noise matrices.
         # Q: WNOA process noise (block-diagonal, 3 x 4x4 blocks for [x, y, vx, vy]).
@@ -442,9 +454,11 @@ class AcousticUKFNode(Node):
         self.last_update_time = self.get_clock().now().nanoseconds / 1e9 - self.update_cooldown
 
         self.leader_depth = config.get('leader_depth', 1.0)
-        depth_topic = build_topic(config.get('depth_topic', 'smarc/depth'))
+        depth_topic_raw = config.get('depth_topic', 'smarc/depth')
         self.depth = None
-        self.create_subscription(Float32, depth_topic, self.depth_callback, 10)
+        if depth_topic_raw:
+            depth_topic = build_topic(depth_topic_raw)
+            self.create_subscription(Float32, depth_topic, self.depth_callback, 10)
 
         # TF2 transform listener (kept for parity / future use).
         self.tf_buffer = Buffer()
@@ -454,9 +468,10 @@ class AcousticUKFNode(Node):
 
         self.last_predict_time = None  # for variable-dt prediction
 
-        self.set_parameters([rclpy.parameter.Parameter('use_sim_time', rclpy.Parameter.Type.BOOL, True)])
-
-        self.get_logger().info('AcousticUKFNode initialized, collecting leader GPS samples...')
+        # use_sim_time is declared above; do not force True (breaks live sticks).
+        use_sim = bool(self.get_parameter('use_sim_time').value)
+        self.get_logger().info(
+            f'AcousticUKFNode initialized (use_sim_time={use_sim}), collecting leader GPS samples...')
 
     def _resolve_config_path(self, config_file):
         """Locate the config YAML across install and source layouts.

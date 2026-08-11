@@ -1,0 +1,53 @@
+# Acoustic UKF for OWTT stick followers (stick_3 on this machine).
+# Leaders stick_1/stick_2 may be on other hosts — use this follower's
+# namespaced OWTT reconstructions, not /stick_1/smarc/latlon from DDS.
+
+# --- WNOA / measurement noise (same ballpark as ukf_config.yaml) ---
+process_noise: 2.0
+measurement_noise: 0.5
+distance_measurement_noise: 1.0
+
+ukf_alpha: 1.0
+ukf_beta: 2.0
+ukf_kappa: 0.0
+
+leader_init_samples: 1
+follower_init_samples: 1
+
+# --- I/O under stick_3 ---
+publish_topic: '/stick_3/ukf/state'
+navsatfix_topic: '/stick_3/ukf/navsatfix'
+delta_pos_topic: '/stick_3/ukf/delta_pos'
+pose_cov_topic: '/stick_3/ukf/pose'
+setpoint_topic: '/stick_3/ukf/setpoint'
+
+dist1_topic: '/stick_3/owtt/stick_1/distance'
+dist2_topic: '/stick_3/owtt/stick_2/distance'
+gps1_topic: '/stick_3/owtt/stick_1/smarc/latlon'
+gps2_topic: '/stick_3/owtt/stick_2/smarc/latlon'
+follower_gps_topic: '/stick_3/smarc/latlon'
+follower_gps_type: 'GeoPoint'
+leader_gps_type: 'GeoPoint'
+
+# No stick IMU/heading needed for air / pier tests; empty skips subscription.
+imu_topic: ''
+heading_topic: ''
+depth_topic: '/stick_3/smarc/depth'
+
+max_speed: 50.0
+correction_factor: 1.0
+range_bias: 0.0
+update_cooldown: 0
+leader_depth: 0.0
+
+heading_measurement_noise: 10
+heading_perturbation: 0
+use_heading_updates: false
+heading_min_speed: 0.2
+setpoint_leader1_weight: 0.7
+
+# Stick modem is colocated with the GNSS antenna for this filter.
+boat_offset: [0.0, 0.0]
+modem_to_baselink_offset_x: 0.0
+modem_to_baselink_offset_y: 0.0
+modem_to_baselink_offset_z: 0.0

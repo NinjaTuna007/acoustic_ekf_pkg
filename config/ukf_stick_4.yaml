@@ -1,0 +1,47 @@
+# Acoustic UKF for OWTT stick_4 follower (same layout as ukf_stick_3.yaml).
+
+process_noise: 2.0
+measurement_noise: 0.5
+distance_measurement_noise: 1.0
+
+ukf_alpha: 1.0
+ukf_beta: 2.0
+ukf_kappa: 0.0
+
+leader_init_samples: 1
+follower_init_samples: 1
+
+publish_topic: '/stick_4/ukf/state'
+navsatfix_topic: '/stick_4/ukf/navsatfix'
+delta_pos_topic: '/stick_4/ukf/delta_pos'
+pose_cov_topic: '/stick_4/ukf/pose'
+setpoint_topic: '/stick_4/ukf/setpoint'
+
+dist1_topic: '/stick_4/owtt/stick_1/distance'
+dist2_topic: '/stick_4/owtt/stick_2/distance'
+gps1_topic: '/stick_4/owtt/stick_1/smarc/latlon'
+gps2_topic: '/stick_4/owtt/stick_2/smarc/latlon'
+follower_gps_topic: '/stick_4/smarc/latlon'
+follower_gps_type: 'GeoPoint'
+leader_gps_type: 'GeoPoint'
+
+imu_topic: ''
+heading_topic: ''
+depth_topic: '/stick_4/smarc/depth'
+
+max_speed: 50.0
+correction_factor: 1.0
+range_bias: 0.0
+update_cooldown: 0
+leader_depth: 0.0
+
+heading_measurement_noise: 10
+heading_perturbation: 0
+use_heading_updates: false
+heading_min_speed: 0.2
+setpoint_leader1_weight: 0.7
+
+boat_offset: [0.0, 0.0]
+modem_to_baselink_offset_x: 0.0
+modem_to_baselink_offset_y: 0.0
+modem_to_baselink_offset_z: 0.0
