@@ -572,6 +572,7 @@ class AcousticUKFNode(Node):
         self.leader_slots = []  # modem ids in state order
         self._type_warned = set()
         self.follower_gps_samples = []
+        self._follower_wait_logged = False
         self.initialization_phase = 'collecting'
         self.follower_utm_offset = None
         self.last_truth_follower_utm = None
@@ -796,17 +797,18 @@ class AcousticUKFNode(Node):
 
     def _handle_follower_gps(self, lat, lon, t):
         if self.initialization_phase != 'ready':
-            self.follower_gps_samples.append((lat, lon))
-            got = len(self.follower_gps_samples)
-            if got <= self.follower_init_samples:
+            if len(self.follower_gps_samples) < self.follower_init_samples:
+                self.follower_gps_samples.append((lat, lon))
                 self.get_logger().info(
-                    f'Follower GPS sample {got}/{self.follower_init_samples}: '
-                    f'lat={lat:.6f}, lon={lon:.6f}')
-            elif got == self.follower_init_samples + 1:
-                self.get_logger().info(
-                    'Follower GPS collected; waiting for leader fixes before the filter starts')
-            if got > self.follower_init_samples:
-                self.follower_gps_samples = self.follower_gps_samples[-self.follower_init_samples:]
+                    f'Follower GPS sample {len(self.follower_gps_samples)}/'
+                    f'{self.follower_init_samples}: lat={lat:.6f}, lon={lon:.6f}')
+            else:
+                self.follower_gps_samples[-1] = (lat, lon)
+                if not self._follower_wait_logged:
+                    self.get_logger().info(
+                        'Follower GPS collected; waiting for leader fixes '
+                        'before the filter starts')
+                    self._follower_wait_logged = True
             gx, gy = self.gps_to_utm(lat, lon)
             if gx is not None and gy is not None:
                 self.last_truth_follower_utm = (gx, gy)
