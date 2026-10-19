@@ -1,11 +1,14 @@
 <?xml version="1.0"?>
 <launch>
+    <arg name="setpoint_modem_ids" default=""
+         description="Two modem ids for the setpoint diameter, e.g. 067,069. Empty uses the two fastest."/>
     <node pkg="acoustic_ekf_pkg"
           exec="ukf_node"
           name="acoustic_ukf_node"
           output="screen">
         <param name="config_file" value="ukf_config.yaml"/>
         <param name="use_sim_time" value="true"/>
+        <param name="setpoint_modem_ids" value="$(var setpoint_modem_ids)"/>
         <!-- Add more parameters as needed -->
         <!-- Published topics (see config/ukf_config.yaml):
                /follower/ukf/state     (std_msgs/Float32MultiArray)

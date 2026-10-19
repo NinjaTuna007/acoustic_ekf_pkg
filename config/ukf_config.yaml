@@ -68,6 +68,11 @@ use_heading_updates: false       # toggle heading updates
 heading_min_speed: 0.2           # m/s
 
 # --- Setpoint generation ---
+# The circle always uses two leaders. Empty uses the two fastest. Set the two
+# moving modem ids to leave a stationary broadcaster out of the arc, e.g.
+# ['067', '069']. The first id is "leader 1" for the weight below.
+# Launch arg setpoint_modem_ids:=067,069 overrides this.
+setpoint_modem_ids: []
 # Bias toward leader 1's orientation estimate when deciding the "behind" side of
 # the leaders for the follower setpoint. Range [0, 1]: 0.5 = equal trust,
 # 1.0 = use leader 1 only.

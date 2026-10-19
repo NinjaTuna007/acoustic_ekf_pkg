@@ -10,7 +10,7 @@ import numpy as np
 import pytest
 import utm
 
-from acoustic_ekf_pkg.ukf_node import UKF
+from acoustic_ekf_pkg.ukf_node import UKF, select_setpoint_pair, setpoint_from_pair
 
 
 def _filter(n_leaders, follower_xy=(0.0, 0.0)):
@@ -253,3 +253,36 @@ def test_node_subscribes_as_modems_appear_and_grows(ros_node):
     assert len(est) == 16
     f = ukf.ukf.follower_index
     assert math.hypot(est[f] - truth[0], est[f + 1] - truth[1]) < 5.0
+
+
+def test_setpoint_uses_the_two_named_leaders():
+    slots = ['067', '069', '111']
+    state = [
+        0.0, 0.0, 0.0, 1.0,
+        100.0, 0.0, 0.0, 1.0,
+        1000.0, 1000.0, 0.0, 0.0,
+    ]
+    assert select_setpoint_pair(slots, state, ['067', '069'], 0.2) == (0, 1)
+    # Heads north, so the arc midpoint is south of the east-west diameter.
+    # The stationary leader at (1000, 1000) is not an input.
+    sp = setpoint_from_pair((0.0, 0.0), (100.0, 0.0), (0.0, 1.0), (0.0, 1.0),
+                            (50.0, -10.0), 0.7, 0.2)
+    assert sp[0] == pytest.approx(50.0)
+    assert sp[1] == pytest.approx(-50.0)
+
+
+def test_setpoint_pair_falls_back_to_the_two_fastest():
+    slots = ['067', '069', '111']
+    state = [
+        0.0, 0.0, 0.0, 1.0,
+        100.0, 0.0, 0.0, 0.0,
+        40.0, 0.0, 1.0, 0.0,
+    ]
+    assert select_setpoint_pair(slots, state, [], 0.2) == (0, 2)
+
+
+def test_setpoint_ids_can_be_unpadded_or_m_prefixed():
+    from acoustic_ekf_pkg.ukf_node import parse_setpoint_modem_ids
+    assert parse_setpoint_modem_ids('67, m069') == ['067', '069']
+    assert select_setpoint_pair(['067', '111'], [0, 0, 0, 0, 1, 0, 0, 0],
+                                ['067', '069'], 0.2) is None

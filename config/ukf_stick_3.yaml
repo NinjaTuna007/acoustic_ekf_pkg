@@ -43,6 +43,7 @@ heading_measurement_noise: 10
 heading_perturbation: 0
 use_heading_updates: false
 heading_min_speed: 0.2
+setpoint_modem_ids: []
 setpoint_leader1_weight: 0.7
 
 # Stick modem is colocated with the GNSS antenna for this filter.

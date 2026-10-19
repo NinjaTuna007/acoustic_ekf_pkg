@@ -69,7 +69,7 @@ Publications
                                      follower pose in absolute UTM metres (frame 'utm');
                                      position covariance is the follower block of P
   /follower/ukf/setpoint           geographic_msgs/GeoPoint  desired follower position:
-                                     semicircle behind the longest leader pair
+                                     semicircle behind the two setpoint leaders
   /follower/ukf/delta_pos          std_msgs/Float32       distance between estimate and follower GPS truth
 
 TF
@@ -94,6 +94,95 @@ from sensor_msgs.msg import Imu, NavSatFix
 from geometry_msgs.msg import PoseWithCovarianceStamped
 from geographic_msgs.msg import GeoPoint
 from tf2_ros import Buffer, TransformListener
+
+
+def parse_setpoint_modem_ids(value):
+    """Modem ids for the setpoint diameter. Accepts '067,069', ['067','069'], or m067."""
+    if value is None:
+        return []
+    if isinstance(value, str):
+        parts = value.replace(';', ',').split(',')
+    else:
+        parts = list(value)
+    ids = []
+    for part in parts:
+        text = str(part).strip()
+        if not text:
+            continue
+        if text[0] in ('m', 'M') and text[1:].isdigit():
+            text = text[1:]
+        if text.isdigit():
+            text = f'{int(text):03d}'
+        ids.append(text)
+    return ids
+
+
+def select_setpoint_pair(slots, state, pinned, min_speed):
+    """Indices of the two leaders that form the setpoint diameter.
+
+    ``pinned`` is the launch/yaml list, in leader-1 then leader-2 order.
+    An empty list uses the two fastest leaders at or above ``min_speed``,
+    ordered by modem id. If fewer than two are moving, the longest pair is
+    used, also ordered by modem id. Missing pinned ids return None.
+    """
+    n = len(slots)
+    if n < 2:
+        return None
+    if pinned:
+        index = {modem: i for i, modem in enumerate(slots)}
+        chosen = [index[modem] for modem in pinned if modem in index]
+        if len(chosen) < 2:
+            return None
+        return chosen[0], chosen[1]
+
+    speeds = []
+    for i in range(n):
+        speeds.append(math.hypot(float(state[i * 4 + 2]), float(state[i * 4 + 3])))
+    moving = [i for i, speed in enumerate(speeds) if speed >= min_speed]
+    if len(moving) >= 2:
+        moving.sort(key=lambda i: speeds[i], reverse=True)
+        pair = sorted(moving[:2], key=lambda i: slots[i])
+        return pair[0], pair[1]
+
+    best = None
+    for i in range(n):
+        for j in range(i + 1, n):
+            dist = math.hypot(
+                float(state[i * 4]) - float(state[j * 4]),
+                float(state[i * 4 + 1]) - float(state[j * 4 + 1]))
+            if best is None or dist > best[0]:
+                best = (dist, i, j)
+    i, j = best[1], best[2]
+    if slots[i] > slots[j]:
+        i, j = j, i
+    return i, j
+
+
+def setpoint_from_pair(p1, p2, v1, v2, follower_xy, weight, min_speed):
+    """Arc-midpoint behind the diameter p1--p2. Same circle as the two-leader setpoint."""
+    p1 = np.asarray(p1, dtype=np.float64)
+    p2 = np.asarray(p2, dtype=np.float64)
+    centre = 0.5 * (p1 + p2)
+    diameter = p2 - p1
+    length = float(np.linalg.norm(diameter))
+    if length < 1e-6:
+        return None
+    radius = 0.5 * length
+    d_hat = diameter / length
+    n_hat = np.array([-d_hat[1], d_hat[0]])
+
+    forward = np.zeros(2)
+    for vel, w in ((v1, weight), (v2, 1.0 - weight)):
+        vel = np.asarray(vel, dtype=np.float64)
+        speed = float(np.linalg.norm(vel))
+        if speed >= min_speed:
+            forward += w * (vel / speed)
+    if float(np.linalg.norm(forward)) > 1e-6:
+        if float(np.dot(n_hat, -forward)) < 0.0:
+            n_hat = -n_hat
+    elif float(np.dot(n_hat, np.asarray(follower_xy, dtype=np.float64) - centre)) < 0.0:
+        n_hat = -n_hat
+    return centre + radius * n_hat
 
 
 class UKF:
@@ -407,9 +496,16 @@ class AcousticUKFNode(Node):
         # the modem->baselink offset correction) to be considered reliable.
         self.heading_min_speed = config.get('heading_min_speed', 0.2)
 
-        # With exactly two leaders the setpoint trusts the lower modem id by
-        # this weight. With any other count every moving leader is equal.
+        # The setpoint circle always uses two leaders. setpoint_leader1_weight
+        # trusts the first of that pair (the lower modem id, unless the launch
+        # list names an order).
         self.setpoint_leader1_weight = float(config.get('setpoint_leader1_weight', 0.7))
+        pinned = parse_setpoint_modem_ids(config.get('setpoint_modem_ids', []))
+        self.declare_parameter('setpoint_modem_ids', '')
+        override = self.get_parameter('setpoint_modem_ids').get_parameter_value().string_value
+        if override.strip():
+            pinned = parse_setpoint_modem_ids(override)
+        self.setpoint_modem_ids = pinned
         self.min_leaders = max(1, int(config.get('min_leaders', 2)))
 
         # UKF unscented-transform tuning parameters.
@@ -538,7 +634,8 @@ class AcousticUKFNode(Node):
         self.get_logger().info(
             f'AcousticUKFNode initialized (use_sim_time={use_sim}). '
             f'Leaders open under {self.leader_topic_root}/m<modem_id>/ '
-            f'(min {self.min_leaders}).')
+            f'(min {self.min_leaders}). '
+            f'Setpoint pair: {self.setpoint_modem_ids or "two fastest"}.')
 
     def _resolve_config_path(self, config_file):
         """Locate the config YAML across install and source layouts.
@@ -964,66 +1061,30 @@ class AcousticUKFNode(Node):
         self.pose_cov_pub.publish(msg)
 
     def _publish_setpoint(self, state, leader_xy, fx, fy):
-        """Publish the desired follower position (GeoPoint) behind the leaders.
+        """Publish the arc-midpoint behind two leaders.
 
-        The diameter is the longest leader-to-leader segment. With two leaders
-        that is the only segment, so the semicircle matches the old setpoint.
-        Its midpoint is the circle centre and its half-length is the radius.
-        The setpoint is centre + radius * n_hat, with n_hat the unit normal
-        pointing backwards relative to the leaders' direction of travel.
-
-        With two leaders the blend trusts the lower modem id by
-        ``setpoint_leader1_weight``. With more, every leader above
-        ``heading_min_speed`` counts equally. If none are moving, the side the
-        follower is already on is kept.
+        The diameter is ``setpoint_modem_ids`` when that list is set, otherwise
+        the two fastest leaders. Every other modem still updates the filter and
+        is left out of the circle. With two leaders and no list, the only pair
+        is that diameter, which is the previous setpoint.
         """
-        if len(leader_xy) < 2:
+        pair = select_setpoint_pair(
+            self.leader_slots, state, self.setpoint_modem_ids, self.heading_min_speed)
+        if pair is None:
+            if self.setpoint_modem_ids:
+                self.get_logger().warn(
+                    f'Setpoint waiting for {self.setpoint_modem_ids}; '
+                    f'in the filter: {self.leader_slots}',
+                    throttle_duration_sec=10.0)
             return
-        best_i, best_j, best_d = 0, 1, -1.0
-        for i in range(len(leader_xy)):
-            for j in range(i + 1, len(leader_xy)):
-                d = math.hypot(
-                    leader_xy[i][0] - leader_xy[j][0],
-                    leader_xy[i][1] - leader_xy[j][1])
-                if d > best_d:
-                    best_i, best_j, best_d = i, j, d
-        p1 = np.array(leader_xy[best_i])
-        p2 = np.array(leader_xy[best_j])
-        centre = 0.5 * (p1 + p2)
-        diameter = p2 - p1
-        d_len = float(np.linalg.norm(diameter))
-        if d_len < 1e-6:
-            return  # leaders coincide; arc is undefined
-        radius = 0.5 * d_len
-
-        # Two unit normals to the diameter; pick the "behind" one below.
-        d_hat = diameter / d_len
-        n_hat = np.array([-d_hat[1], d_hat[0]])
-
-        # Leaders' forward direction from estimated velocities (east, north).
-        n = len(leader_xy)
-        if n == 2:
-            weights = [self.setpoint_leader1_weight, 1.0 - self.setpoint_leader1_weight]
-        else:
-            weights = [1.0] * n
-        forward = np.zeros(2)
-        for i, w in enumerate(weights):
-            v = np.array([state[i * 4 + 2], state[i * 4 + 3]])
-            speed = float(np.linalg.norm(v))
-            if speed >= self.heading_min_speed:
-                forward += w * (v / speed)
-
-        if float(np.linalg.norm(forward)) > 1e-6:
-            # "Behind" = opposite the leaders' heading. Choose the normal whose
-            # direction aligns with backward (n_hat . (-forward) > 0).
-            if float(np.dot(n_hat, -forward)) < 0.0:
-                n_hat = -n_hat
-        else:
-            # No reliable orientation: pick the side the follower is on.
-            if float(np.dot(n_hat, np.array([fx, fy]) - centre)) < 0.0:
-                n_hat = -n_hat
-
-        setpoint = centre + radius * n_hat
+        i, j = pair
+        setpoint = setpoint_from_pair(
+            leader_xy[i], leader_xy[j],
+            (state[i * 4 + 2], state[i * 4 + 3]),
+            (state[j * 4 + 2], state[j * 4 + 3]),
+            (fx, fy), self.setpoint_leader1_weight, self.heading_min_speed)
+        if setpoint is None:
+            return
         if abs(setpoint[0]) > 1e7 or abs(setpoint[1]) > 1e7:
             return
         sp_lat, sp_lon = self.utm_to_gps(float(setpoint[0]), float(setpoint[1]))
