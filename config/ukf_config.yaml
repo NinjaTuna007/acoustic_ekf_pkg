@@ -26,15 +26,15 @@ follower_init_samples: 1
 
 # --- ROS topics (read + publish) ---
 publish_topic: '/follower/ukf/state'
-# NavSatFix outputs; '_leader1'/'_leader2'/'_centroid' are appended to this base.
+# NavSatFix outputs. '_<modem_id>' and '_centroid' are appended to this base.
 navsatfix_topic: '/follower/ukf/navsatfix'
 delta_pos_topic: '/follower/ukf/delta_pos'
 pose_cov_topic: '/follower/ukf/pose'      # PoseWithCovarianceStamped (UTM metres, frame 'utm')
 setpoint_topic: '/follower/ukf/setpoint'  # geographic_msgs/GeoPoint: desired follower position (behind leaders)
-dist1_topic: '/leader1/distance'
-dist2_topic: '/leader2/distance'
-gps1_topic: '/leader1/smarc/latlon'
-gps2_topic: '/leader2/smarc/latlon'
+# Follower opens /lolo/owtt/m<modem_id>/smarc/latlon and .../distance on the
+# first broadcast. This node subscribes as those topics appear.
+leader_topic_root: '/lolo/owtt'
+min_leaders: 2
 follower_gps_topic: '/lolo/standard/navsatfix'
 follower_gps_type: 'NavSatFix'   # 'GeoPoint' or 'NavSatFix'
 leader_gps_type: 'GeoPoint'     # 'GeoPoint' or 'NavSatFix'

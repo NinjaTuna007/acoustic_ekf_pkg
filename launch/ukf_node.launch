@@ -9,7 +9,7 @@
         <!-- Add more parameters as needed -->
         <!-- Published topics (see config/ukf_config.yaml):
                /follower/ukf/state     (std_msgs/Float32MultiArray)
-               /follower/ukf/navsatfix (sensor_msgs/NavSatFix)  [+_leader1/_leader2/_centroid]
+               /follower/ukf/navsatfix (sensor_msgs/NavSatFix)  [_<modem_id>/_centroid]
                /follower/ukf/pose      (geometry_msgs/PoseWithCovarianceStamped)
                /follower/ukf/setpoint  (geographic_msgs/GeoPoint)  desired follower position
                /follower/ukf/delta_pos (std_msgs/Float32) -->

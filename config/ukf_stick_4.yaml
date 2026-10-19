@@ -17,10 +17,9 @@ delta_pos_topic: '/stick_4/ukf/delta_pos'
 pose_cov_topic: '/stick_4/ukf/pose'
 setpoint_topic: '/stick_4/ukf/setpoint'
 
-dist1_topic: '/stick_4/owtt/stick_1/distance'
-dist2_topic: '/stick_4/owtt/stick_2/distance'
-gps1_topic: '/stick_4/owtt/stick_1/smarc/latlon'
-gps2_topic: '/stick_4/owtt/stick_2/smarc/latlon'
+# Follower opens /stick_4/owtt/m<modem_id>/smarc/latlon and .../distance.
+leader_topic_root: '/stick_4/owtt'
+min_leaders: 2
 follower_gps_topic: '/stick_4/smarc/latlon'
 follower_gps_type: 'GeoPoint'
 leader_gps_type: 'GeoPoint'

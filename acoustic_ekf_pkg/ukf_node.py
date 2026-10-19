@@ -1,15 +1,26 @@
 #!/usr/bin/env python3
 """Unscented Kalman Filter (UKF) node for acoustic follower localization.
 
-This node estimates the relative positions/velocities of two leader vehicles and
-one follower vehicle from:
+This node estimates the relative positions/velocities of however many leader
+vehicles it hears, plus one follower, from:
   - leader GPS (NavSatFix / GeoPoint)  -> leader position pseudo-measurements
   - acoustic range (Float32)           -> leader<->follower distance measurements
   - follower heading (Float32)         -> follower velocity-direction measurement
   - IMU / follower GPS timestamps      -> drive the constant-velocity prediction
 
-State vector (12), all in metres relative to the follower's UTM origin:
-    [x1, y1, vx1, vy1, x2, y2, vx2, vy2, xf, yf, vfx, vfy]
+Leaders are not listed. The node watches ``leader_topic_root`` for the same
+topics the OWTT follower opens on the first broadcast from a modem:
+
+    <root>/m<modem_id>/smarc/latlon
+    <root>/m<modem_id>/distance
+
+State vector, metres relative to the follower's UTM origin. Each leader is
+four elements ``[x, y, vx, vy]`` and the follower is the last four:
+
+    [x1, y1, vx1, vy1, ..., xN, yN, vxN, vyN, xf, yf, vfx, vfy]
+
+The filter starts once ``min_leaders`` modems have a fix. A modem heard after
+that is appended.
 
 The process model is constant-velocity (WNOA process noise). The measurement
 models (acoustic range and heading) are non-linear, which is exactly where the
@@ -33,33 +44,33 @@ Parameters
 
 Subscriptions
 -------------
-  /leader1/distance            std_msgs/Float32      acoustic slant range to leader 1
-  /leader2/distance            std_msgs/Float32      acoustic slant range to leader 2
-  /leader1/gps                 sensor_msgs/NavSatFix leader 1 GPS  (or geographic_msgs/GeoPoint
+  <root>/m<modem_id>/distance     std_msgs/Float32      acoustic slant range to that modem
+  <root>/m<modem_id>/smarc/latlon sensor_msgs/NavSatFix that modem's GPS (or geographic_msgs/GeoPoint
                                                       if leader_gps_type='GeoPoint')
-  /leader2/gps                 sensor_msgs/NavSatFix leader 2 GPS  (or GeoPoint)
-  /lolo/standard/navsatfix     sensor_msgs/NavSatFix follower GPS  (or GeoPoint if
+  /lolo/standard/navsatfix       sensor_msgs/NavSatFix follower GPS  (or GeoPoint if
                                                       follower_gps_type='GeoPoint');
                                                       also triggers a prediction step
-  /lolo/standard/imu           sensor_msgs/Imu       timestamp source for prediction steps
-  /lolo/smarc/depth            std_msgs/Float32      follower depth (slant->horizontal range)
-  /lolo/smarc/heading          std_msgs/Float32      external heading; subscribed ONLY when
-                                                      use_heading_updates=true (off by default)
+  /lolo/standard/imu             sensor_msgs/Imu       timestamp source for prediction steps
+  /lolo/smarc/depth              std_msgs/Float32      follower depth (slant->horizontal range)
+  /lolo/smarc/heading            std_msgs/Float32      external heading; subscribed when
+                                                      heading_topic is set
+
+``<root>`` is ``leader_topic_root`` (default ``/lolo/owtt``). A subscription is
+created the first time that topic shows up, and only if its type matches.
 
 Publications
 ------------
-  /follower/ukf/state            std_msgs/Float32MultiArray
-                                   full 12-element state vector (relative UTM metres)
+  /follower/ukf/state              std_msgs/Float32MultiArray
+                                     state vector, 4*(n_leaders+1) elements
   /follower/ukf/navsatfix          sensor_msgs/NavSatFix  follower lat/lon (baselink)
-  /follower/ukf/navsatfix_leader1  sensor_msgs/NavSatFix  leader 1 lat/lon
-  /follower/ukf/navsatfix_leader2  sensor_msgs/NavSatFix  leader 2 lat/lon
-  /follower/ukf/navsatfix_centroid sensor_msgs/NavSatFix  centroid of the three vehicles
-  /follower/ukf/pose             geometry_msgs/PoseWithCovarianceStamped
-                                   follower pose in absolute UTM metres (frame 'utm') with the
-                                   position covariance block P[8:10, 8:10]; yaw from estimated heading
-  /follower/ukf/setpoint         geographic_msgs/GeoPoint  desired follower position (lat/lon/alt):
-                                   apex of the semicircle behind the two leaders (diameter = leader1<->leader2)
-  /follower/ukf/delta_pos        std_msgs/Float32       distance between estimate and follower GPS truth
+  /follower/ukf/navsatfix_<modem>  sensor_msgs/NavSatFix  that leader's lat/lon
+  /follower/ukf/navsatfix_centroid sensor_msgs/NavSatFix  centroid of follower + leaders
+  /follower/ukf/pose               geometry_msgs/PoseWithCovarianceStamped
+                                     follower pose in absolute UTM metres (frame 'utm');
+                                     position covariance is the follower block of P
+  /follower/ukf/setpoint           geographic_msgs/GeoPoint  desired follower position:
+                                     semicircle behind the longest leader pair
+  /follower/ukf/delta_pos          std_msgs/Float32       distance between estimate and follower GPS truth
 
 TF
 --
@@ -86,32 +97,44 @@ from tf2_ros import Buffer, TransformListener
 
 
 class UKF:
-    """Unscented Kalman Filter for 2 leaders + 1 follower (12-state).
+    """Unscented Kalman Filter for N leaders + 1 follower.
 
     Computations are done in float64 for numerical stability (the unscented
     transform relies on a Cholesky factorisation of the covariance, which is
     sensitive to round-off in float32).
     """
 
-    N = 12  # state dimension
-
     def __init__(self, initial_state, Q, R, dt=0.0, max_velocity=500.0,
                  alpha=1.0, beta=2.0, kappa=0.0):
+        initial_state = np.asarray(initial_state, dtype=np.float64).reshape(-1)
+        if initial_state.size < 8 or initial_state.size % 4 != 0:
+            raise ValueError(
+                f'UKF state length must be 4*(n_leaders+1) and at least 8, '
+                f'got {initial_state.size}')
+        self.n_leaders = initial_state.size // 4 - 1
+        self.N = initial_state.size
         self.dt = float(dt)
         self.Q = np.asarray(Q, dtype=np.float64)
         self.R = np.asarray(R, dtype=np.float64)
         self.max_velocity = float(max_velocity)
 
-        self.x = initial_state.reshape((self.N, 1)).astype(np.float64)
+        self.x = initial_state.reshape((self.N, 1))
         self.P = np.eye(self.N, dtype=np.float64) * 4.0
 
         # Van der Merwe scaled unscented-transform weights.
         self.alpha = float(alpha)
         self.beta = float(beta)
         self.kappa = float(kappa)
+        self._set_weights()
+
+    @property
+    def follower_index(self):
+        """Index of the follower's x component. Leaders occupy ``[0, f)``."""
+        return 4 * self.n_leaders
+
+    def _set_weights(self):
         self.lambda_ = self.alpha ** 2 * (self.N + self.kappa) - self.N
         self._gamma = math.sqrt(self.N + self.lambda_)  # sigma-point spread
-
         c = self.N + self.lambda_
         self.Wm = np.full(2 * self.N + 1, 1.0 / (2.0 * c))
         self.Wc = np.full(2 * self.N + 1, 1.0 / (2.0 * c))
@@ -129,8 +152,10 @@ class UKF:
 
     def _clip_velocities(self):
         """Clip all velocity components to +/- max_velocity (parity with EKF)."""
-        for idx in (2, 3, 6, 7, 10, 11):
-            self.x[idx] = np.clip(self.x[idx], -self.max_velocity, self.max_velocity)
+        for block in range(self.n_leaders + 1):
+            for idx in (block * 4 + 2, block * 4 + 3):
+                self.x[idx, 0] = np.clip(
+                    self.x[idx, 0], -self.max_velocity, self.max_velocity)
 
     def _sigma_points(self):
         """Generate the 2N+1 sigma points from the current (x, P)."""
@@ -159,20 +184,19 @@ class UKF:
         """Constant-velocity process model for a single sigma point."""
         dt = self.dt
         out = s.copy()
-        out[0] = s[0] + s[2] * dt   # x1
-        out[1] = s[1] + s[3] * dt   # y1
-        out[4] = s[4] + s[6] * dt   # x2
-        out[5] = s[5] + s[7] * dt   # y2
-        out[8] = s[8] + s[10] * dt  # xf
-        out[9] = s[9] + s[11] * dt  # yf
+        for block in range(self.n_leaders + 1):
+            b = block * 4
+            out[b] = s[b] + s[b + 2] * dt
+            out[b + 1] = s[b + 1] + s[b + 3] * dt
         return out
 
     @staticmethod
     def _hx_leader(s, leader_id):
         """Measurement model: [leader_x, leader_y, range(leader, follower)]."""
+        f = len(s) - 4  # follower is the last block
         lx = s[leader_id * 4]
         ly = s[leader_id * 4 + 1]
-        dist = math.hypot(lx - s[8], ly - s[9])
+        dist = math.hypot(lx - s[f], ly - s[f + 1])
         return np.array([lx, ly, dist])
 
     # ------------------------------------------------------------------ steps
@@ -210,10 +234,11 @@ class UKF:
         """
         z = np.asarray(z, dtype=np.float64).flatten()
         fx = self.x.flatten()
+        f = self.follower_index
         lx = fx[leader_id * 4]
         ly = fx[leader_id * 4 + 1]
-        xf = fx[8]
-        yf = fx[9]
+        xf = fx[f]
+        yf = fx[f + 1]
         dist = math.hypot(lx - xf, ly - yf)
         if dist < 1e-6:
             dist = 1e-6
@@ -224,8 +249,8 @@ class UKF:
         H[1, leader_id * 4 + 1] = 1.0
         H[2, leader_id * 4] = (lx - xf) / dist
         H[2, leader_id * 4 + 1] = (ly - yf) / dist
-        H[2, 8] = (xf - lx) / dist
-        H[2, 9] = (yf - ly) / dist
+        H[2, f] = (xf - lx) / dist
+        H[2, f + 1] = (yf - ly) / dist
 
         S = H @ self.P @ H.T + self.R
         K = self.P @ H.T @ np.linalg.inv(S)
@@ -244,14 +269,15 @@ class UKF:
         Angles are handled circularly (sigma-point mean via sin/cos, residuals
         wrapped to [-pi, pi]).
         """
-        vfx = float(self.x[10])
-        vfy = float(self.x[11])
+        f = self.follower_index
+        vfx = float(self.x[f + 2, 0])
+        vfy = float(self.x[f + 3, 0])
         if math.hypot(vfx, vfy) < 1e-3:
             return self.x.flatten()  # direction is unobservable at near-zero speed
 
         z = math.radians(heading_deg)
         sigmas = self._sigma_points()
-        Zsig = np.array([math.atan2(s[10], s[11]) for s in sigmas])
+        Zsig = np.array([math.atan2(s[f + 2], s[f + 3]) for s in sigmas])
 
         # Circular (weighted) mean of the predicted heading sigma points.
         zmean = math.atan2(float(self.Wm @ np.sin(Zsig)),
@@ -273,6 +299,49 @@ class UKF:
         self._symmetrize()
         self._clip_velocities()
         return self.x.flatten()
+
+    def add_leader(self, x, y):
+        """Append one leader in front of the follower block.
+
+        Existing leader blocks stay put. The follower block shifts by four.
+        The new leader starts at ``(x, y)`` with zero velocity and the same
+        initial variance the filter uses at startup (4 m^2 on its diagonal).
+        """
+        old_f = self.follower_index
+        old_n = self.N
+        n2 = old_n + 4
+
+        new_x = np.zeros((n2, 1), dtype=np.float64)
+        new_x[:old_f] = self.x[:old_f]
+        new_x[old_f, 0] = float(x)
+        new_x[old_f + 1, 0] = float(y)
+        new_x[old_f + 4:] = self.x[old_f:]
+
+        new_P = np.zeros((n2, n2), dtype=np.float64)
+        new_P[:old_f, :old_f] = self.P[:old_f, :old_f]
+        new_P[:old_f, old_f + 4:] = self.P[:old_f, old_f:]
+        new_P[old_f + 4:, :old_f] = self.P[old_f:, :old_f]
+        new_P[old_f + 4:, old_f + 4:] = self.P[old_f:, old_f:]
+        new_P[old_f:old_f + 4, old_f:old_f + 4] = np.eye(4, dtype=np.float64) * 4.0
+
+        Q = np.asarray(self.Q, dtype=np.float64)
+        new_Q = np.zeros((n2, n2), dtype=np.float64)
+        if Q.shape == (old_n, old_n):
+            new_Q[:old_f, :old_f] = Q[:old_f, :old_f]
+            new_Q[:old_f, old_f + 4:] = Q[:old_f, old_f:]
+            new_Q[old_f + 4:, :old_f] = Q[old_f:, :old_f]
+            new_Q[old_f + 4:, old_f + 4:] = Q[old_f:, old_f:]
+            if old_f >= 4:
+                new_Q[old_f:old_f + 4, old_f:old_f + 4] = Q[:4, :4]
+            else:
+                new_Q[old_f:old_f + 4, old_f:old_f + 4] = np.eye(4)
+
+        self.n_leaders += 1
+        self.N = n2
+        self.x = new_x
+        self.P = new_P
+        self.Q = new_Q
+        self._set_weights()
 
     def get_state(self):
         return self.x.flatten()
@@ -338,14 +407,14 @@ class AcousticUKFNode(Node):
         # the modem->baselink offset correction) to be considered reliable.
         self.heading_min_speed = config.get('heading_min_speed', 0.2)
 
-        # Setpoint generation: weight bias toward leader 1's orientation estimate
-        # when blending the two leaders' headings to decide the "behind" side.
-        # Must be in [0, 1]; 0.5 = equal trust, 1.0 = leader 1 only.
+        # With exactly two leaders the setpoint trusts the lower modem id by
+        # this weight. With any other count every moving leader is equal.
         self.setpoint_leader1_weight = float(config.get('setpoint_leader1_weight', 0.7))
+        self.min_leaders = max(1, int(config.get('min_leaders', 2)))
 
         # UKF unscented-transform tuning parameters.
         # alpha=1.0, kappa=0.0 -> lambda=0, which is numerically well-conditioned
-        # for this 12-dim state (small alpha makes the central weight blow up and
+        # for this state (small alpha makes the central weight blow up and
         # can destroy positive-definiteness of the covariance).
         self.ukf_alpha = config.get('ukf_alpha', 1.0)
         self.ukf_beta = config.get('ukf_beta', 2.0)
@@ -362,13 +431,9 @@ class AcousticUKFNode(Node):
             return f'/{relative_topic}'
 
         publish_topic = build_topic(config.get('publish_topic', 'follower/ukf/state'))
-        # NavSatFix outputs (follower + leaders + centroid). The base name gets
-        # the '_leader1' / '_leader2' / '_centroid' suffixes appended below.
-        navsatfix_topic = build_topic(config.get('navsatfix_topic', 'follower/ukf/navsatfix'))
-        dist1_topic = build_topic(config.get('dist1_topic', 'follower/leader1/distance'))
-        dist2_topic = build_topic(config.get('dist2_topic', 'follower/leader2/distance'))
-        gps1_topic = build_topic(config.get('gps1_topic', '/leader1/smarc/latlon'))
-        gps2_topic = build_topic(config.get('gps2_topic', '/leader2/smarc/latlon'))
+        # Per-leader NavSatFix topics append _<modem_id>. Centroid appends _centroid.
+        self.navsatfix_topic = build_topic(
+            config.get('navsatfix_topic', 'follower/ukf/navsatfix'))
         follower_gps_topic = build_topic(config.get('follower_gps_topic', 'smarc/latlon'))
         delta_pos_topic = build_topic(config.get('delta_pos_topic', 'ukf/delta_pos'))
         pose_cov_topic = build_topic(config.get('pose_cov_topic', 'follower/ukf/pose'))
@@ -376,13 +441,23 @@ class AcousticUKFNode(Node):
         leader_gps_type = config.get('leader_gps_type', 'NavSatFix')
         self.leader_gps_type = leader_gps_type
         follower_gps_type = config.get('follower_gps_type', 'NavSatFix')
+        root = config.get('leader_topic_root', '') or ''
+        if not root:
+            root = f'/{follower_ns}/owtt' if follower_ns else '/owtt'
+        self.leader_topic_root = build_topic(root).rstrip('/')
+        if self.leader_gps_type == 'GeoPoint':
+            self._leader_gps_msg = GeoPoint
+            self._leader_gps_type_name = 'geographic_msgs/msg/GeoPoint'
+        else:
+            self._leader_gps_msg = NavSatFix
+            self._leader_gps_type_name = 'sensor_msgs/msg/NavSatFix'
+        self._distance_type_name = 'std_msgs/msg/Float32'
 
         # Publishers
         self.state_pub = self.create_publisher(Float32MultiArray, publish_topic, 10)
-        self.navsatfix_pub = self.create_publisher(NavSatFix, navsatfix_topic, 10)
-        self.navsatfix_pub_leader1 = self.create_publisher(NavSatFix, navsatfix_topic + "_leader1", 10)
-        self.navsatfix_pub_leader2 = self.create_publisher(NavSatFix, navsatfix_topic + "_leader2", 10)
-        self.navsatfix_pub_centroid = self.create_publisher(NavSatFix, navsatfix_topic + "_centroid", 10)
+        self.navsatfix_pub = self.create_publisher(NavSatFix, self.navsatfix_topic, 10)
+        self.navsatfix_pub_centroid = self.create_publisher(
+            NavSatFix, self.navsatfix_topic + '_centroid', 10)
         self.delta_pos_pub = self.create_publisher(Float32, delta_pos_topic, 10)
         self.pose_cov_pub = self.create_publisher(PoseWithCovarianceStamped, pose_cov_topic, 10)
         # Setpoint is a target coordinate -> geographic_msgs/GeoPoint (lat/lon/alt).
@@ -395,34 +470,25 @@ class AcousticUKFNode(Node):
         self.utm_zone_number = None
         self.utm_zone_letter = None
 
-        # Initialization tracking
-        self.leader_gps_samples = {1: [], 2: []}
+        # One entry per modem once its topics appear. slot is None until the
+        # filter has a state block for it.
+        self.leaders = {}
+        self.leader_slots = []  # modem ids in state order
+        self._type_warned = set()
         self.follower_gps_samples = []
-        self.initialization_phase = 'collecting_leaders'  # -> 'collecting_follower' -> 'ready'
+        self.initialization_phase = 'collecting'
         self.follower_utm_offset = None
         self.last_truth_follower_utm = None
-
-        # Latest measurements in UTM coordinates
-        self.current_leader_positions = {1: None, 2: None}
-        self.last_distances = {1: None, 2: None}
 
         # UKF instance
         self.ukf = None
 
-        # Subscriptions (identical to ekf_node.py)
-        self.create_subscription(Float32, dist1_topic, self.dist1_callback, 10)
-        self.create_subscription(Float32, dist2_topic, self.dist2_callback, 10)
-        if leader_gps_type == 'GeoPoint':
-            self.create_subscription(GeoPoint, gps1_topic, self.gps1_geopoint_callback, 10)
-            self.create_subscription(GeoPoint, gps2_topic, self.gps2_geopoint_callback, 10)
-        else:
-            self.create_subscription(NavSatFix, gps1_topic, self.gps1_callback, 10)
-            self.create_subscription(NavSatFix, gps2_topic, self.gps2_callback, 10)
-
         if follower_gps_type == 'GeoPoint':
-            self.create_subscription(GeoPoint, follower_gps_topic, self.follower_gps_geopoint_callback, 10)
+            self.create_subscription(
+                GeoPoint, follower_gps_topic, self.follower_gps_geopoint_callback, 10)
         else:
-            self.create_subscription(NavSatFix, follower_gps_topic, self.follower_gps_callback, 10)
+            self.create_subscription(
+                NavSatFix, follower_gps_topic, self.follower_gps_callback, 10)
 
         # Heading: optional external compass. Empty heading_topic skips the sub;
         # sticks typically leave this empty and rely on velocity-derived heading.
@@ -441,11 +507,9 @@ class AcousticUKFNode(Node):
         else:
             self.get_logger().info('imu_topic empty; IMU predict disabled (GPS-driven predict only)')
 
-        # Noise matrices.
-        # Q: WNOA process noise (block-diagonal, 3 x 4x4 blocks for [x, y, vx, vy]).
-        self.Q = self.make_WNOA(process_noise, dt=max(self.dt, 0.1))
         # R: leader x/y use measurement_noise^2, distance uses its own noise.
-        self.R = np.eye(3, dtype=np.float32)
+        # Q is built when the filter starts, once the leader count is known.
+        self.R = np.eye(3, dtype=np.float64)
         self.R[0, 0] = measurement_noise ** 2
         self.R[1, 1] = measurement_noise ** 2
         self.R[2, 2] = distance_measurement_noise ** 2
@@ -470,8 +534,11 @@ class AcousticUKFNode(Node):
 
         # use_sim_time is declared above; do not force True (breaks live sticks).
         use_sim = bool(self.get_parameter('use_sim_time').value)
+        self.create_timer(0.5, self._scan_leaders)
         self.get_logger().info(
-            f'AcousticUKFNode initialized (use_sim_time={use_sim}), collecting leader GPS samples...')
+            f'AcousticUKFNode initialized (use_sim_time={use_sim}). '
+            f'Leaders open under {self.leader_topic_root}/m<modem_id>/ '
+            f'(min {self.min_leaders}).')
 
     def _resolve_config_path(self, config_file):
         """Locate the config YAML across install and source layouts.
@@ -522,37 +589,102 @@ class AcousticUKFNode(Node):
             self.get_logger().error(f'UTM to GPS conversion failed: {e}')
             return None, None
 
-    # ----------------------------------------------------------- leader GPS
-    def _handle_leader_gps(self, leader_id, lat, lon):
-        """Shared logic for leader GPS (NavSatFix or GeoPoint)."""
-        if self.initialization_phase == 'collecting_leaders':
-            self.leader_gps_samples[leader_id].append((lat, lon))
-            self.get_logger().info(
-                f'Leader {leader_id} GPS sample '
-                f'{len(self.leader_gps_samples[leader_id])}/{self.leader_init_samples}: '
-                f'lat={lat:.6f}, lon={lon:.6f}')
-            self._check_leader_initialization()
-        elif self.initialization_phase == 'ready':
-            x, y = self.gps_to_utm(lat, lon)
-            if x is not None and y is not None and self.follower_utm_offset is not None:
-                offset_x = x - self.follower_utm_offset[0] - self.boat_offset[0]
-                offset_y = y - self.follower_utm_offset[1] - self.boat_offset[1]
-                self.current_leader_positions[leader_id] = (offset_x, offset_y)
+    # ----------------------------------------------------------- discovery
+    def _scan_leaders(self):
+        """Subscribe to owtt/m<modem_id>/ topics as the follower creates them."""
+        root = self.leader_topic_root + '/'
+        seen = {}
+        for name, types in self.get_topic_names_and_types():
+            if not name.startswith(root):
+                continue
+            rest = name[len(root):]
+            parts = rest.split('/')
+            if len(parts) == 2 and parts[1] == 'distance':
+                kind = 'distance'
+            elif len(parts) == 3 and parts[1] == 'smarc' and parts[2] == 'latlon':
+                kind = 'latlon'
             else:
-                self.get_logger().warn(
-                    f'Follower UTM offset not initialized or UTM conversion failed for leader {leader_id}!')
+                continue
+            token = parts[0]
+            # Follower publishes m067, not 067: a topic token cannot start with a digit.
+            if len(token) != 4 or token[0] != 'm' or not token[1:].isdigit():
+                continue
+            modem = token[1:]
+            seen.setdefault(modem, {})[kind] = (name, types)
 
-    def gps1_callback(self, msg):
-        self._handle_leader_gps(1, msg.latitude, msg.longitude)
+        for modem, kinds in seen.items():
+            leader = self.leaders.get(modem)
+            if leader is None:
+                leader = {
+                    'samples': [],
+                    'pos': None,
+                    'dist': None,
+                    'slot': None,
+                    'navsat_pub': self.create_publisher(
+                        NavSatFix, f'{self.navsatfix_topic}_{modem}', 10),
+                }
+                self.leaders[modem] = leader
+                self.get_logger().info(
+                    f'Leader {modem} -> {root}m{modem}/smarc/latlon, {root}m{modem}/distance')
+            if 'distance' in kinds and 'dist_sub' not in leader:
+                topic, types = kinds['distance']
+                if self._distance_type_name in types:
+                    leader['dist_sub'] = self.create_subscription(
+                        Float32, topic,
+                        lambda msg, m=modem: self._handle_distance(m, msg.data), 10)
+                else:
+                    self._warn_type(topic, types, self._distance_type_name)
+            if 'latlon' in kinds and 'gps_sub' not in leader:
+                topic, types = kinds['latlon']
+                if self._leader_gps_type_name in types:
+                    leader['gps_sub'] = self.create_subscription(
+                        self._leader_gps_msg, topic,
+                        lambda msg, m=modem: self._handle_leader_gps(
+                            m, msg.latitude, msg.longitude), 10)
+                else:
+                    self._warn_type(topic, types, self._leader_gps_type_name)
 
-    def gps2_callback(self, msg):
-        self._handle_leader_gps(2, msg.latitude, msg.longitude)
+    def _warn_type(self, topic, types, expected):
+        if topic in self._type_warned:
+            return
+        self._type_warned.add(topic)
+        self.get_logger().error(
+            f'{topic} is {types}, expected {expected}; not subscribing')
 
-    def gps1_geopoint_callback(self, msg):
-        self._handle_leader_gps(1, msg.latitude, msg.longitude)
+    def _relative_xy(self, lat, lon):
+        """Leader position in the follower-origin frame, or None."""
+        if self.follower_utm_offset is None:
+            return None
+        x, y = self.gps_to_utm(lat, lon)
+        if x is None or y is None:
+            return None
+        return (
+            x - self.follower_utm_offset[0] - self.boat_offset[0],
+            y - self.follower_utm_offset[1] - self.boat_offset[1],
+        )
 
-    def gps2_geopoint_callback(self, msg):
-        self._handle_leader_gps(2, msg.latitude, msg.longitude)
+    # ----------------------------------------------------------- leader GPS
+    def _handle_leader_gps(self, modem_id, lat, lon):
+        """Shared logic for leader GPS (NavSatFix or GeoPoint)."""
+        leader = self.leaders.get(modem_id)
+        if leader is None:
+            return
+        leader['samples'].append((lat, lon))
+        if self.initialization_phase != 'ready':
+            self.get_logger().info(
+                f'Leader {modem_id} GPS sample '
+                f'{len(leader["samples"])}/{self.leader_init_samples}: '
+                f'lat={lat:.6f}, lon={lon:.6f}')
+            self._try_initialize()
+            return
+        rel = self._relative_xy(lat, lon)
+        if rel is None:
+            self.get_logger().warn(
+                f'UTM conversion failed for leader {modem_id}')
+            return
+        leader['pos'] = rel
+        if leader['slot'] is None:
+            self._adopt_leader(modem_id)
 
     # ----------------------------------------------------------- follower GPS
     def follower_gps_callback(self, msg):
@@ -566,15 +698,17 @@ class AcousticUKFNode(Node):
         self._handle_follower_gps(msg.latitude, msg.longitude, t)
 
     def _handle_follower_gps(self, lat, lon, t):
-        if self.initialization_phase == 'collecting_follower':
+        if self.initialization_phase != 'ready':
             self.follower_gps_samples.append((lat, lon))
             self.get_logger().info(
-                f'Follower GPS sample {len(self.follower_gps_samples)}/{self.follower_init_samples}: '
-                f'lat={lat:.6f}, lon={lon:.6f}')
-            if len(self.follower_gps_samples) >= self.follower_init_samples:
-                self._initialize_ukf()
+                f'Follower GPS sample {len(self.follower_gps_samples)}/'
+                f'{self.follower_init_samples}: lat={lat:.6f}, lon={lon:.6f}')
+            gx, gy = self.gps_to_utm(lat, lon)
+            if gx is not None and gy is not None:
+                self.last_truth_follower_utm = (gx, gy)
+            if self._try_initialize():
                 self.last_predict_time = t
-        elif self.initialization_phase == 'ready' and self.ukf is not None:
+        elif self.ukf is not None:
             if self.last_predict_time is not None:
                 dt = t - self.last_predict_time
                 if 0.0 < dt < 2.0:
@@ -606,31 +740,30 @@ class AcousticUKFNode(Node):
             self.get_logger().error(f'Error computing horizontal distance: {e}')
             return slant
 
-    def _handle_distance(self, leader_id, raw_distance):
-        if self.initialization_phase != 'ready':
+    def _handle_distance(self, modem_id, raw_distance):
+        leader = self.leaders.get(modem_id)
+        if leader is None:
+            return
+        d = raw_distance * self.correction_factor
+        leader['dist'] = self._horizontal_distance(d) + self.range_bias
+        if self.initialization_phase != 'ready' or leader['slot'] is None:
+            return
+        if leader['pos'] is None:
             return
         with self.lock:
             now = self.get_clock().now().nanoseconds / 1e9
             if now - self.last_update_time < self.update_cooldown:
                 return
-            d = raw_distance * self.correction_factor
-            self.last_distances[leader_id] = self._horizontal_distance(d) + self.range_bias
-            if self.current_leader_positions[leader_id] is not None:
-                z = np.array([
-                    self.current_leader_positions[leader_id][0],
-                    self.current_leader_positions[leader_id][1],
-                    self.last_distances[leader_id],
-                ], dtype=np.float32)
-                self.get_logger().info(f'Updating UKF with leader {leader_id} measurement: {z}')
-                self.ukf.update(z, leader_id - 1)  # UKF leader index is 0-based
-                self.last_update_time = now
-                self._publish_outputs()
-
-    def dist1_callback(self, msg):
-        self._handle_distance(1, msg.data)
-
-    def dist2_callback(self, msg):
-        self._handle_distance(2, msg.data)
+            z = np.array([
+                leader['pos'][0],
+                leader['pos'][1],
+                leader['dist'],
+            ], dtype=np.float64)
+            self.get_logger().info(
+                f'Updating UKF with leader {modem_id} measurement: {z}')
+            self.ukf.update(z, leader['slot'])
+            self.last_update_time = now
+            self._publish_outputs()
 
     # ----------------------------------------------------------- heading
     def heading_callback(self, msg):
@@ -671,77 +804,107 @@ class AcousticUKFNode(Node):
         self.depth = msg.data
 
     # ----------------------------------------------------------- init
-    def _check_leader_initialization(self):
-        if (len(self.leader_gps_samples[1]) >= self.leader_init_samples and
-                len(self.leader_gps_samples[2]) >= self.leader_init_samples):
-            self.initialization_phase = 'collecting_follower'
-            self.get_logger().info('Leaders initialized, now collecting follower GPS samples...')
+    def _ready_modems(self):
+        return sorted(
+            modem for modem, leader in self.leaders.items()
+            if len(leader['samples']) >= self.leader_init_samples
+            and leader['slot'] is None)
 
-    def _initialize_ukf(self):
-        """Initialize the UKF from collected GPS samples; store follower UTM offset."""
-        self.get_logger().info('Initializing UKF...')
-        leader1_samples = self.leader_gps_samples[1][-self.leader_init_samples:]
-        leader2_samples = self.leader_gps_samples[2][-self.leader_init_samples:]
-        if len(leader1_samples) < self.leader_init_samples or len(leader2_samples) < self.leader_init_samples:
-            self.get_logger().error('Not enough leader GPS samples to initialize UKF')
-            return
+    def _try_initialize(self):
+        if self.initialization_phase == 'ready' or self.ukf is not None:
+            return False
+        ready = self._ready_modems()
+        if len(ready) < self.min_leaders:
+            return False
         if len(self.follower_gps_samples) < self.follower_init_samples:
-            self.get_logger().error('Not enough follower GPS samples to initialize UKF')
-            return
+            return False
+        return self._initialize_ukf(ready)
 
-        avg_lat1 = sum(s[0] for s in leader1_samples) / len(leader1_samples)
-        avg_lon1 = sum(s[1] for s in leader1_samples) / len(leader1_samples)
-        avg_lat2 = sum(s[0] for s in leader2_samples) / len(leader2_samples)
-        avg_lon2 = sum(s[1] for s in leader2_samples) / len(leader2_samples)
-        avg_flat = sum(s[0] for s in self.follower_gps_samples) / len(self.follower_gps_samples)
-        avg_flon = sum(s[1] for s in self.follower_gps_samples) / len(self.follower_gps_samples)
+    def _mean_latlon(self, samples):
+        window = samples[-self.leader_init_samples:]
+        lat = sum(s[0] for s in window) / len(window)
+        lon = sum(s[1] for s in window) / len(window)
+        return lat, lon
 
-        leader1_x, leader1_y = self.gps_to_utm(avg_lat1, avg_lon1)
-        leader2_x, leader2_y = self.gps_to_utm(avg_lat2, avg_lon2)
+    def _follower_modem_origin(self):
+        """Follower modem position relative to the GPS/baselink origin."""
+        if self.follower_heading_deg is None:
+            self.get_logger().warn(
+                'No follower heading at init; modem placed at baselink origin')
+            return 0.0, 0.0
+        h = math.radians(self.follower_heading_deg)
+        ox = self.modem_to_baselink_offset_x
+        oy = self.modem_to_baselink_offset_y
+        # NED heading (0=North, 90=East): body +x -> [E, N] = [sin h, cos h].
+        xf0 = ox * math.sin(h) + oy * math.cos(h)
+        yf0 = ox * math.cos(h) - oy * math.sin(h)
+        self.get_logger().info(
+            f'Init follower modem offset from heading {self.follower_heading_deg:.1f} deg: '
+            f'({xf0:.2f}, {yf0:.2f}) m')
+        return xf0, yf0
+
+    def _abort_init(self, modem_ids):
+        for modem in modem_ids:
+            self.leaders[modem]['slot'] = None
+        self.leader_slots = [m for m in self.leader_slots if m not in modem_ids]
+        self.follower_utm_offset = None
+
+    def _initialize_ukf(self, modem_ids):
+        """Initialize from every modem that already has a fix, sorted by id."""
+        self.get_logger().info(f'Initializing UKF with leaders {modem_ids}...')
+        samples = self.follower_gps_samples[-self.follower_init_samples:]
+        avg_flat = sum(s[0] for s in samples) / len(samples)
+        avg_flon = sum(s[1] for s in samples) / len(samples)
         follower_x, follower_y = self.gps_to_utm(avg_flat, avg_flon)
-        if None in [leader1_x, leader1_y, leader2_x, leader2_y, follower_x, follower_y]:
-            self.get_logger().error('Failed to convert GPS to UTM coordinates')
-            return
-
+        if follower_x is None or follower_y is None:
+            self.get_logger().error('Failed to convert follower GPS to UTM')
+            return False
         self.follower_utm_offset = np.array([follower_x, follower_y], dtype=np.float64)
-        leader1_x_adj = leader1_x - self.boat_offset[0]
-        leader1_y_adj = leader1_y - self.boat_offset[1]
-        leader2_x_adj = leader2_x - self.boat_offset[0]
-        leader2_y_adj = leader2_y - self.boat_offset[1]
 
-        # Place the follower MODEM (the acoustic-range endpoint) relative to the
-        # follower's GPS/baselink origin using the known compass heading. The
-        # follower state tracks the modem, but the GPS origin is the baselink, so
-        # without this the state would start ~modem_to_baselink_offset_x metres
-        # off and have to drift to reconcile with the ranges. NED heading
-        # (0=North, 90=East): forward (body +x) -> [E, N] = [sin h, cos h];
-        # starboard (body +y) -> [cos h, -sin h].
-        xf0 = yf0 = 0.0
-        if self.follower_heading_deg is not None:
-            h = math.radians(self.follower_heading_deg)
-            ox = self.modem_to_baselink_offset_x
-            oy = self.modem_to_baselink_offset_y
-            xf0 = ox * math.sin(h) + oy * math.cos(h)
-            yf0 = ox * math.cos(h) - oy * math.sin(h)
-            self.get_logger().info(
-                f'Init follower modem offset from heading {self.follower_heading_deg:.1f} deg: '
-                f'({xf0:.2f}, {yf0:.2f}) m')
-        else:
-            self.get_logger().warn('No follower heading at init; modem placed at baselink origin')
+        state = []
+        for modem in modem_ids:
+            leader = self.leaders[modem]
+            lat, lon = self._mean_latlon(leader['samples'])
+            rel = self._relative_xy(lat, lon)
+            if rel is None:
+                self.get_logger().error(f'Failed to convert leader {modem} GPS to UTM')
+                self._abort_init(modem_ids)
+                return False
+            leader['pos'] = rel
+            leader['slot'] = len(state) // 4
+            state.extend([rel[0], rel[1], 0.0, 0.0])
+            self.leader_slots.append(modem)
 
-        # State: [x1, y1, vx1, vy1, x2, y2, vx2, vy2, xf, yf, vfx, vfy]
-        initial_state = np.array([
-            leader1_x_adj - follower_x, leader1_y_adj - follower_y, 0.0, 0.0,
-            leader2_x_adj - follower_x, leader2_y_adj - follower_y, 0.0, 0.0,
-            xf0, yf0, 0.0, 0.0,
-        ], dtype=np.float32)
-
-        self.ukf = UKF(initial_state, Q=self.Q, R=self.R, dt=self.dt,
-                       max_velocity=self.max_speed,
-                       alpha=self.ukf_alpha, beta=self.ukf_beta, kappa=self.ukf_kappa)
+        xf0, yf0 = self._follower_modem_origin()
+        state.extend([xf0, yf0, 0.0, 0.0])
+        self.ukf = UKF(
+            np.array(state, dtype=np.float64),
+            Q=self.make_WNOA(
+                self.process_noise, max(self.dt, 0.1), n_blocks=len(modem_ids) + 1),
+            R=self.R, dt=self.dt, max_velocity=self.max_speed,
+            alpha=self.ukf_alpha, beta=self.ukf_beta, kappa=self.ukf_kappa)
         self.initialization_phase = 'ready'
-        self.get_logger().info(f'UKF initialized with UTM offset: {self.follower_utm_offset}')
-        self.get_logger().info('UKF ready for operation!')
+        self.get_logger().info(
+            f'UKF ready ({self.ukf.n_leaders} leaders), '
+            f'UTM offset {self.follower_utm_offset}')
+        return True
+
+    def _adopt_leader(self, modem_id):
+        """Give a modem heard after startup its own state block."""
+        leader = self.leaders[modem_id]
+        if leader['slot'] is not None or leader['pos'] is None or self.ukf is None:
+            return
+        with self.lock:
+            if leader['slot'] is not None:
+                return
+            slot = self.ukf.n_leaders
+            self.ukf.add_leader(leader['pos'][0], leader['pos'][1])
+            self.ukf.Q = self.make_WNOA(self.process_noise, max(self.ukf.dt, 0.1))
+            leader['slot'] = slot
+            self.leader_slots.append(modem_id)
+            self.get_logger().info(
+                f'Leader {modem_id} joined the filter as slot {slot} '
+                f'({self.ukf.n_leaders} leaders)')
 
     # ----------------------------------------------------------- publishing
     def _publish_navsat(self, publisher, lat, lon):
@@ -760,13 +923,14 @@ class AcousticUKFNode(Node):
 
         Position is in absolute UTM metres (easting=x, northing=y) in the 'utm'
         frame. The 6x6 pose covariance is filled from the filter's follower
-        position block P[8:10, 8:10] (x, y); z and the orientation axes are
-        marked unknown (large variance) since they are not estimated. Orientation
-        encodes the estimated heading as yaw (ENU: yaw measured CCW from east).
+        position block; z and the orientation axes are marked unknown (large
+        variance) since they are not estimated. Orientation encodes the
+        estimated heading as yaw (ENU: yaw measured CCW from east).
         """
         if self.ukf is None:
             return
         P = self.ukf.get_covariance()
+        f = self.ukf.follower_index
 
         msg = PoseWithCovarianceStamped()
         msg.header.stamp = self.get_clock().now().to_msg()
@@ -787,10 +951,10 @@ class AcousticUKFNode(Node):
         # 6x6 row-major covariance: order [x, y, z, rot_x, rot_y, rot_z].
         UNKNOWN = 1e6  # large variance flags an unestimated DoF
         cov = [0.0] * 36
-        cov[0] = float(P[8, 8])    # xx
-        cov[1] = float(P[8, 9])    # xy
-        cov[6] = float(P[9, 8])    # yx
-        cov[7] = float(P[9, 9])    # yy
+        cov[0] = float(P[f, f])          # xx
+        cov[1] = float(P[f, f + 1])      # xy
+        cov[6] = float(P[f + 1, f])      # yx
+        cov[7] = float(P[f + 1, f + 1])  # yy
         cov[14] = UNKNOWN          # zz
         cov[21] = UNKNOWN          # rot_x
         cov[28] = UNKNOWN          # rot_y
@@ -799,23 +963,32 @@ class AcousticUKFNode(Node):
 
         self.pose_cov_pub.publish(msg)
 
-    def _publish_setpoint(self, state, l1x, l1y, l2x, l2y, fx, fy):
+    def _publish_setpoint(self, state, leader_xy, fx, fy):
         """Publish the desired follower position (GeoPoint) behind the leaders.
 
-        Geometry: treat the segment leader1<->leader2 as the diameter of a circle.
-        Its midpoint is the circle centre and its half-length is the radius. The
-        setpoint is the apex of the semicircle on the side *behind* the leaders,
-        i.e. centre + radius * n_hat, where n_hat is the unit normal to the
-        diameter pointing backwards relative to the leaders' direction of travel.
+        The diameter is the longest leader-to-leader segment. With two leaders
+        that is the only segment, so the semicircle matches the old setpoint.
+        Its midpoint is the circle centre and its half-length is the radius.
+        The setpoint is centre + radius * n_hat, with n_hat the unit normal
+        pointing backwards relative to the leaders' direction of travel.
 
-        The "behind" side is chosen from the leaders' estimated orientations
-        (direction of their estimated velocities), trusting leader 1 more
-        (``setpoint_leader1_weight``). If neither leader's orientation is
-        reliable (both nearly stationary), we fall back to the side the follower
-        is currently estimated to be on, so the setpoint stays sensible.
+        With two leaders the blend trusts the lower modem id by
+        ``setpoint_leader1_weight``. With more, every leader above
+        ``heading_min_speed`` counts equally. If none are moving, the side the
+        follower is already on is kept.
         """
-        p1 = np.array([l1x, l1y])
-        p2 = np.array([l2x, l2y])
+        if len(leader_xy) < 2:
+            return
+        best_i, best_j, best_d = 0, 1, -1.0
+        for i in range(len(leader_xy)):
+            for j in range(i + 1, len(leader_xy)):
+                d = math.hypot(
+                    leader_xy[i][0] - leader_xy[j][0],
+                    leader_xy[i][1] - leader_xy[j][1])
+                if d > best_d:
+                    best_i, best_j, best_d = i, j, d
+        p1 = np.array(leader_xy[best_i])
+        p2 = np.array(leader_xy[best_j])
         centre = 0.5 * (p1 + p2)
         diameter = p2 - p1
         d_len = float(np.linalg.norm(diameter))
@@ -827,19 +1000,18 @@ class AcousticUKFNode(Node):
         d_hat = diameter / d_len
         n_hat = np.array([-d_hat[1], d_hat[0]])
 
-        # Leaders' forward direction from estimated velocities (east, north),
-        # blended with a bias toward leader 1.
-        v1 = np.array([state[2], state[3]])
-        v2 = np.array([state[6], state[7]])
-        s1 = float(np.linalg.norm(v1))
-        s2 = float(np.linalg.norm(v2))
-        w1 = self.setpoint_leader1_weight
-        w2 = 1.0 - w1
+        # Leaders' forward direction from estimated velocities (east, north).
+        n = len(leader_xy)
+        if n == 2:
+            weights = [self.setpoint_leader1_weight, 1.0 - self.setpoint_leader1_weight]
+        else:
+            weights = [1.0] * n
         forward = np.zeros(2)
-        if s1 >= self.heading_min_speed:
-            forward += w1 * (v1 / s1)
-        if s2 >= self.heading_min_speed:
-            forward += w2 * (v2 / s2)
+        for i, w in enumerate(weights):
+            v = np.array([state[i * 4 + 2], state[i * 4 + 3]])
+            speed = float(np.linalg.norm(v))
+            if speed >= self.heading_min_speed:
+                forward += w * (v / speed)
 
         if float(np.linalg.norm(forward)) > 1e-6:
             # "Behind" = opposite the leaders' heading. Choose the normal whose
@@ -869,8 +1041,9 @@ class AcousticUKFNode(Node):
         ``heading_min_speed`` (velocity direction is unreliable near zero speed),
         or None if no estimate is available yet.
         """
-        vfx = float(state[10])
-        vfy = float(state[11])
+        f = self.ukf.follower_index
+        vfx = float(state[f + 2])
+        vfy = float(state[f + 3])
         if math.hypot(vfx, vfy) >= self.heading_min_speed:
             # NED convention: 0=North, 90=East -> atan2(east, north) = atan2(vfx, vfy)
             self.current_heading_deg = math.degrees(math.atan2(vfx, vfy))
@@ -888,8 +1061,9 @@ class AcousticUKFNode(Node):
         self.state_pub.publish(state_msg)
 
         # Follower modem position in absolute UTM.
-        follower_modem_x = state[8] + self.follower_utm_offset[0]
-        follower_modem_y = state[9] + self.follower_utm_offset[1]
+        f = self.ukf.follower_index
+        follower_modem_x = state[f] + self.follower_utm_offset[0]
+        follower_modem_y = state[f + 1] + self.follower_utm_offset[1]
 
         # Reverse the modem->baselink offset using the heading estimated by the
         # filter itself (direction of the estimated follower velocity, NED:
@@ -929,46 +1103,35 @@ class AcousticUKFNode(Node):
             delta_msg.data = float(delta)
             self.delta_pos_pub.publish(delta_msg)
 
-        # Leader 1 absolute position.
-        leader1_x = state[0] + self.follower_utm_offset[0] + self.boat_offset[0]
-        leader1_y = state[1] + self.follower_utm_offset[1] + self.boat_offset[1]
-        leader1_ok = abs(leader1_x) <= 1e7 and abs(leader1_y) <= 1e7
-        if leader1_ok:
-            leader1_lat, leader1_lon = self.utm_to_gps(leader1_x, leader1_y)
-            if leader1_lat is not None and leader1_lon is not None:
-                self._publish_navsat(self.navsatfix_pub_leader1, leader1_lat, leader1_lon)
-        else:
-            self.get_logger().warn(
-                f'Leader1 UTM values out of range: x={leader1_x}, y={leader1_y}. Skipping publish.')
+        leader_xy = []
+        for slot, modem in enumerate(self.leader_slots):
+            lx = state[slot * 4] + self.follower_utm_offset[0] + self.boat_offset[0]
+            ly = state[slot * 4 + 1] + self.follower_utm_offset[1] + self.boat_offset[1]
+            if abs(lx) > 1e7 or abs(ly) > 1e7:
+                self.get_logger().warn(
+                    f'Leader {modem} UTM out of range: x={lx}, y={ly}. Skipping.')
+                continue
+            lat, lon = self.utm_to_gps(lx, ly)
+            pub = self.leaders[modem]['navsat_pub']
+            if lat is not None and lon is not None:
+                self._publish_navsat(pub, lat, lon)
+            leader_xy.append((lx, ly))
 
-        # Leader 2 absolute position.
-        leader2_x = state[4] + self.follower_utm_offset[0] + self.boat_offset[0]
-        leader2_y = state[5] + self.follower_utm_offset[1] + self.boat_offset[1]
-        leader2_ok = abs(leader2_x) <= 1e7 and abs(leader2_y) <= 1e7
-        if leader2_ok:
-            leader2_lat, leader2_lon = self.utm_to_gps(leader2_x, leader2_y)
-            if leader2_lat is not None and leader2_lon is not None:
-                self._publish_navsat(self.navsatfix_pub_leader2, leader2_lat, leader2_lon)
-        else:
-            self.get_logger().warn(
-                f'Leader2 UTM values out of range: x={leader2_x}, y={leader2_y}. Skipping publish.')
-
-        # Centroid of all three positions.
-        if (follower_lat is not None and follower_lon is not None and leader1_ok and leader2_ok):
-            centroid_x = (follower_x + leader1_x + leader2_x) / 3.0
-            centroid_y = (follower_y + leader1_y + leader2_y) / 3.0
+        if follower_lat is not None and follower_lon is not None and leader_xy:
+            centroid_x = (follower_x + sum(p[0] for p in leader_xy)) / (len(leader_xy) + 1)
+            centroid_y = (follower_y + sum(p[1] for p in leader_xy)) / (len(leader_xy) + 1)
             centroid_lat, centroid_lon = self.utm_to_gps(centroid_x, centroid_y)
             if centroid_lat is not None and centroid_lon is not None:
                 self._publish_navsat(self.navsatfix_pub_centroid, centroid_lat, centroid_lon)
 
-        # Follower setpoint (apex of the semicircle behind the two leaders).
-        if leader1_ok and leader2_ok:
-            self._publish_setpoint(state, leader1_x, leader1_y, leader2_x, leader2_y,
-                                   follower_x, follower_y)
+        if len(leader_xy) == len(self.leader_slots):
+            self._publish_setpoint(state, leader_xy, follower_x, follower_y)
 
     # ----------------------------------------------------------- process noise
-    def make_WNOA(self, process_noise, dt):
-        """Block-diagonal WNOA process noise (3 x 4x4 blocks for [x, y, vx, vy])."""
+    def make_WNOA(self, process_noise, dt, n_blocks=None):
+        """Block-diagonal WNOA process noise, one 4x4 block per vehicle."""
+        if n_blocks is None:
+            n_blocks = self.ukf.n_leaders + 1 if self.ukf is not None else 1
         dt = float(max(dt, 1e-3))  # guard against zero
         dt2 = dt * dt
         dt3 = dt2 * dt
@@ -978,9 +1141,10 @@ class AcousticUKFNode(Node):
             [0, dt4 / 4, 0, dt3 / 2],
             [dt3 / 2, 0, dt2, 0],
             [0, dt3 / 2, 0, dt2],
-        ], dtype=np.float32)
-        Q = np.zeros((12, 12), dtype=np.float32)
-        for i in range(3):
+        ], dtype=np.float64)
+        n = 4 * n_blocks
+        Q = np.zeros((n, n), dtype=np.float64)
+        for i in range(n_blocks):
             Q[i * 4:(i + 1) * 4, i * 4:(i + 1) * 4] = block
         return Q
 

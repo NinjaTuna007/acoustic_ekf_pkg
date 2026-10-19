@@ -1,6 +1,6 @@
 # Acoustic UKF for OWTT stick followers (stick_3 on this machine).
-# Leaders stick_1/stick_2 may be on other hosts — use this follower's
-# namespaced OWTT reconstructions, not /stick_1/smarc/latlon from DDS.
+# Leaders may be on other hosts. Fuse this follower's owtt/m<modem_id>/ topics,
+# not /stick_N/smarc/latlon from DDS.
 
 # --- WNOA / measurement noise (same ballpark as ukf_config.yaml) ---
 process_noise: 2.0
@@ -21,10 +21,9 @@ delta_pos_topic: '/stick_3/ukf/delta_pos'
 pose_cov_topic: '/stick_3/ukf/pose'
 setpoint_topic: '/stick_3/ukf/setpoint'
 
-dist1_topic: '/stick_3/owtt/stick_1/distance'
-dist2_topic: '/stick_3/owtt/stick_2/distance'
-gps1_topic: '/stick_3/owtt/stick_1/smarc/latlon'
-gps2_topic: '/stick_3/owtt/stick_2/smarc/latlon'
+# Follower opens /stick_3/owtt/m<modem_id>/smarc/latlon and .../distance.
+leader_topic_root: '/stick_3/owtt'
+min_leaders: 2
 follower_gps_topic: '/stick_3/smarc/latlon'
 follower_gps_type: 'GeoPoint'
 leader_gps_type: 'GeoPoint'
