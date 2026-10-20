@@ -37,6 +37,10 @@ leader_topic_root: '/lolo/owtt'
 min_leaders: 2
 follower_gps_topic: '/lolo/standard/navsatfix'
 follower_gps_type: 'NavSatFix'   # 'GeoPoint' or 'NavSatFix'
+# delta_pos is UKF vs this fix. smarc/latlon is the odometry position and
+# keeps moving underwater. The GPS topic above still clocks the filter.
+delta_truth_topic: '/lolo/smarc/latlon'
+delta_truth_type: 'GeoPoint'     # 'GeoPoint' or 'NavSatFix'
 leader_gps_type: 'GeoPoint'     # 'GeoPoint' or 'NavSatFix'
 imu_topic: '/lolo/standard/imu'
 depth_topic: '/lolo/smarc/depth'

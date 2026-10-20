@@ -50,6 +50,9 @@ Subscriptions
   /lolo/standard/navsatfix       sensor_msgs/NavSatFix follower GPS  (or GeoPoint if
                                                       follower_gps_type='GeoPoint');
                                                       also triggers a prediction step
+  /lolo/smarc/latlon             geographic_msgs/GeoPoint  delta_pos truth when
+                                                      delta_truth_topic is set. The
+                                                      filter clock stays on the GPS topic.
   /lolo/standard/imu             sensor_msgs/Imu       timestamp source for prediction steps
   /lolo/smarc/depth              std_msgs/Float32      follower depth (slant->horizontal range)
   /lolo/smarc/heading            std_msgs/Float32      external heading; subscribed when
@@ -576,6 +579,7 @@ class AcousticUKFNode(Node):
         self.initialization_phase = 'collecting'
         self.follower_utm_offset = None
         self.last_truth_follower_utm = None
+        self._separate_delta_truth = False
 
         # UKF instance
         self.ukf = None
@@ -586,6 +590,25 @@ class AcousticUKFNode(Node):
         else:
             self.create_subscription(
                 NavSatFix, follower_gps_topic, self.follower_gps_callback, 10)
+
+        # delta_pos truth. Empty keeps the follower GPS topic. A separate topic
+        # (LoLo: /lolo/smarc/latlon) is not used to clock the filter.
+        delta_truth_topic = config.get('delta_truth_topic', '') or ''
+        self._separate_delta_truth = bool(delta_truth_topic) and delta_truth_topic != follower_gps_topic
+        if self._separate_delta_truth:
+            delta_truth_topic = build_topic(delta_truth_topic)
+            delta_truth_type = config.get('delta_truth_type', 'GeoPoint')
+            if delta_truth_type == 'GeoPoint':
+                self.create_subscription(
+                    GeoPoint, delta_truth_topic, self._delta_truth_geopoint, 10)
+            else:
+                self.create_subscription(
+                    NavSatFix, delta_truth_topic, self._delta_truth_navsat, 10)
+            self.get_logger().info(
+                f'delta_pos compares against {delta_truth_topic} ({delta_truth_type})')
+        else:
+            self.get_logger().info(
+                f'delta_pos compares against {follower_gps_topic}')
 
         # Heading: optional external compass. Empty heading_topic skips the sub;
         # sticks typically leave this empty and rely on velocity-derived heading.
@@ -785,6 +808,17 @@ class AcousticUKFNode(Node):
             self._adopt_leader(modem_id)
 
     # ----------------------------------------------------------- follower GPS
+    def _remember_truth(self, lat, lon):
+        gx, gy = self.gps_to_utm(lat, lon)
+        if gx is not None and gy is not None:
+            self.last_truth_follower_utm = (gx, gy)
+
+    def _delta_truth_navsat(self, msg):
+        self._remember_truth(msg.latitude, msg.longitude)
+
+    def _delta_truth_geopoint(self, msg):
+        self._remember_truth(msg.latitude, msg.longitude)
+
     def follower_gps_callback(self, msg):
         """Follower GPS (NavSatFix): init samples + variable-dt prediction trigger."""
         t = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
@@ -809,9 +843,8 @@ class AcousticUKFNode(Node):
                         'Follower GPS collected; waiting for leader fixes '
                         'before the filter starts')
                     self._follower_wait_logged = True
-            gx, gy = self.gps_to_utm(lat, lon)
-            if gx is not None and gy is not None:
-                self.last_truth_follower_utm = (gx, gy)
+            if not self._separate_delta_truth:
+                self._remember_truth(lat, lon)
             if self._try_initialize():
                 self.last_predict_time = t
         elif self.ukf is not None:
@@ -819,9 +852,8 @@ class AcousticUKFNode(Node):
                 dt = t - self.last_predict_time
                 if 0.0 < dt < 2.0:
                     with self.lock:
-                        gx, gy = self.gps_to_utm(lat, lon)
-                        if gx is not None and gy is not None:
-                            self.last_truth_follower_utm = (gx, gy)
+                        if not self._separate_delta_truth:
+                            self._remember_truth(lat, lon)
                         self.ukf.dt = float(dt)
                         self.ukf.Q = self.make_WNOA(self.process_noise, dt)
                         self.ukf.predict()
@@ -830,9 +862,8 @@ class AcousticUKFNode(Node):
                     self.get_logger().warn(f'Large dt gap: {dt:.3f}s, skipping prediction')
             self.last_predict_time = t
         else:
-            gx, gy = self.gps_to_utm(lat, lon)
-            if gx is not None and gy is not None:
-                self.last_truth_follower_utm = (gx, gy)
+            if not self._separate_delta_truth:
+                self._remember_truth(lat, lon)
 
     # ----------------------------------------------------------- distance
     def _horizontal_distance(self, slant):
@@ -1165,7 +1196,7 @@ class AcousticUKFNode(Node):
         # Publish follower pose + covariance (absolute UTM metres, frame 'utm').
         self._publish_pose_with_cov(follower_x, follower_y, heading_deg)
 
-        # Delta to ground truth.
+        # Delta to the configured truth fix (smarc/latlon on LoLo).
         if self.last_truth_follower_utm is not None:
             truth_x, truth_y = self.last_truth_follower_utm
             delta = math.sqrt((follower_x - truth_x) ** 2 + (follower_y - truth_y) ** 2)
