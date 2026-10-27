@@ -161,8 +161,55 @@ def select_setpoint_pair(slots, state, pinned, min_speed):
     return i, j
 
 
-def setpoint_from_pair(p1, p2, v1, v2, follower_xy, weight, min_speed):
-    """Arc-midpoint behind the diameter p1--p2. Same circle as the two-leader setpoint."""
+def leader_forward(v1, v2, weight, min_speed):
+    """Speed-weighted sum of the leaders that are actually moving.
+
+    A leader slower than ``min_speed`` is left out. The rest are added as
+    velocity, not as a unit vector, so a slow leader cannot outvote a fast one.
+    Returns None when neither leader qualifies.
+    """
+    forward = np.zeros(2, dtype=np.float64)
+    moving = False
+    for vel, w in ((v1, weight), (v2, 1.0 - weight)):
+        vel = np.asarray(vel, dtype=np.float64)
+        if float(np.linalg.norm(vel)) < min_speed:
+            continue
+        forward += w * vel
+        moving = True
+    if not moving or float(np.linalg.norm(forward)) < 1e-6:
+        return None
+    return forward
+
+
+def hold_setpoint_course(vote, held, disagree_since, now, hold_s):
+    """Formation course to use for the behind-side.
+
+    ``vote`` is the current leader-forward, or None when nobody is moving.
+    A vote into the opposite half-plane is ignored until it has lasted
+    ``hold_s``, so a leader that stops or backs up for a moment does not
+    throw the setpoint onto the other side of the pair. A weak vote keeps
+    the course already in use. Returns ``(course, disagree_since)``.
+    """
+    if vote is None:
+        return held, None
+    if held is None or float(np.dot(held, vote)) >= 0.0:
+        return vote, None
+    if disagree_since is None:
+        return held, now
+    if now - disagree_since >= hold_s:
+        return vote, None
+    return held, disagree_since
+
+
+def setpoint_from_pair(p1, p2, v1, v2, follower_xy, weight, min_speed,
+                       forward=None):
+    """Arc-midpoint behind the diameter p1--p2.
+
+    ``forward`` is the formation course. When it is omitted the course is the
+    speed-weighted leader velocity. A missing course (nobody moving, and no
+    course held by the caller) leaves the arc on the side the follower is
+    already on.
+    """
     p1 = np.asarray(p1, dtype=np.float64)
     p2 = np.asarray(p2, dtype=np.float64)
     centre = 0.5 * (p1 + p2)
@@ -174,13 +221,9 @@ def setpoint_from_pair(p1, p2, v1, v2, follower_xy, weight, min_speed):
     d_hat = diameter / length
     n_hat = np.array([-d_hat[1], d_hat[0]])
 
-    forward = np.zeros(2)
-    for vel, w in ((v1, weight), (v2, 1.0 - weight)):
-        vel = np.asarray(vel, dtype=np.float64)
-        speed = float(np.linalg.norm(vel))
-        if speed >= min_speed:
-            forward += w * (vel / speed)
-    if float(np.linalg.norm(forward)) > 1e-6:
+    if forward is None:
+        forward = leader_forward(v1, v2, weight, min_speed)
+    if forward is not None and float(np.linalg.norm(forward)) > 1e-6:
         if float(np.dot(n_hat, -forward)) < 0.0:
             n_hat = -n_hat
     elif float(np.dot(n_hat, np.asarray(follower_xy, dtype=np.float64) - centre)) < 0.0:
@@ -503,6 +546,11 @@ class AcousticUKFNode(Node):
         # trusts the first of that pair (the lower modem id, unless the launch
         # list names an order).
         self.setpoint_leader1_weight = float(config.get('setpoint_leader1_weight', 0.7))
+        # How long a reversed formation course must last before the arc flips
+        # to the other side of the leader pair.
+        self.setpoint_course_hold_s = float(config.get('setpoint_course_hold_s', 2.0))
+        self._setpoint_course = None
+        self._setpoint_disagree_since = None
         pinned = parse_setpoint_modem_ids(config.get('setpoint_modem_ids', []))
         self.declare_parameter('setpoint_modem_ids', '')
         override = self.get_parameter('setpoint_modem_ids').get_parameter_value().string_value
@@ -1014,6 +1062,8 @@ class AcousticUKFNode(Node):
 
         xf0, yf0 = self._follower_modem_origin()
         state.extend([xf0, yf0, 0.0, 0.0])
+        self._setpoint_course = None
+        self._setpoint_disagree_since = None
         self.ukf = UKF(
             np.array(state, dtype=np.float64),
             Q=self.make_WNOA(
@@ -1118,11 +1168,19 @@ class AcousticUKFNode(Node):
                     throttle_duration_sec=10.0)
             return
         i, j = pair
+        v1 = (state[i * 4 + 2], state[i * 4 + 3])
+        v2 = (state[j * 4 + 2], state[j * 4 + 3])
+        vote = leader_forward(
+            v1, v2, self.setpoint_leader1_weight, self.heading_min_speed)
+        now = self.get_clock().now().nanoseconds * 1e-9
+        course, self._setpoint_disagree_since = hold_setpoint_course(
+            vote, self._setpoint_course, self._setpoint_disagree_since,
+            now, self.setpoint_course_hold_s)
+        self._setpoint_course = course
         setpoint = setpoint_from_pair(
-            leader_xy[i], leader_xy[j],
-            (state[i * 4 + 2], state[i * 4 + 3]),
-            (state[j * 4 + 2], state[j * 4 + 3]),
-            (fx, fy), self.setpoint_leader1_weight, self.heading_min_speed)
+            leader_xy[i], leader_xy[j], v1, v2,
+            (fx, fy), self.setpoint_leader1_weight, self.heading_min_speed,
+            forward=course)
         if setpoint is None:
             return
         if abs(setpoint[0]) > 1e7 or abs(setpoint[1]) > 1e7:

@@ -40,6 +40,7 @@ use_heading_updates: false
 heading_min_speed: 0.2
 setpoint_modem_ids: []
 setpoint_leader1_weight: 0.7
+setpoint_course_hold_s: 2.0
 
 boat_offset: [0.0, 0.0]
 modem_to_baselink_offset_x: 0.0
