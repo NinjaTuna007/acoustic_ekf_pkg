@@ -10,7 +10,9 @@ import numpy as np
 import pytest
 import utm
 
-from acoustic_ekf_pkg.ukf_node import UKF, select_setpoint_pair, setpoint_from_pair
+from acoustic_ekf_pkg.ukf_node import (
+    UKF, hold_setpoint_course, leader_forward, select_setpoint_pair,
+    setpoint_from_pair)
 
 
 def _filter(n_leaders, follower_xy=(0.0, 0.0)):
@@ -267,6 +269,41 @@ def test_setpoint_uses_the_two_named_leaders():
     # The stationary leader at (1000, 1000) is not an input.
     sp = setpoint_from_pair((0.0, 0.0), (100.0, 0.0), (0.0, 1.0), (0.0, 1.0),
                             (50.0, -10.0), 0.7, 0.2)
+    assert sp[0] == pytest.approx(50.0)
+    assert sp[1] == pytest.approx(-50.0)
+
+
+def test_slow_leader_cannot_flip_the_arc():
+    # Leader 1 is barely moving backward. A unit-vector vote would let its
+    # 0.7 weight flip the arc; its actual speed must not outvote leader 2.
+    sp = setpoint_from_pair(
+        (0.0, 0.0), (100.0, 0.0), (0.0, -0.25), (0.0, 1.5),
+        (50.0, -10.0), 0.7, 0.2)
+    assert sp[0] == pytest.approx(50.0)
+    assert sp[1] == pytest.approx(-50.0)
+
+
+def test_brief_reverse_keeps_the_held_side():
+    north = leader_forward((0.0, 1.5), (0.0, 1.5), 0.7, 0.2)
+    course, since = hold_setpoint_course(north, None, None, now=0.0, hold_s=2.0)
+    reverse = leader_forward((0.0, -1.5), (0.0, 1.5), 0.7, 0.2)
+    assert float(np.dot(course, reverse)) < 0.0
+    held, since = hold_setpoint_course(reverse, course, since, now=0.5, hold_s=2.0)
+    sp = setpoint_from_pair(
+        (0.0, 0.0), (100.0, 0.0), (0.0, -1.5), (0.0, 1.5),
+        (50.0, -10.0), 0.7, 0.2, forward=held)
+    assert sp[1] == pytest.approx(-50.0)
+    flipped, _ = hold_setpoint_course(reverse, course, since, now=2.5, hold_s=2.0)
+    sp_flip = setpoint_from_pair(
+        (0.0, 0.0), (100.0, 0.0), (0.0, -1.5), (0.0, 1.5),
+        (50.0, -10.0), 0.7, 0.2, forward=flipped)
+    assert sp_flip[1] == pytest.approx(50.0)
+
+
+def test_stopped_leaders_stay_on_the_follower_side():
+    sp = setpoint_from_pair(
+        (0.0, 0.0), (100.0, 0.0), (0.0, 0.0), (0.0, 0.0),
+        (50.0, -10.0), 0.7, 0.2)
     assert sp[0] == pytest.approx(50.0)
     assert sp[1] == pytest.approx(-50.0)
 
